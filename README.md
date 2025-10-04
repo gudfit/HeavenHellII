@@ -35,7 +35,7 @@ $$ W^*(\tau) = \max_{v\ne g}\max\\{0,\mathrm{rest_weight}(v)-\tau(v)\\}, $$
 
 * **Friction:** $\tau:V\to\mathbb{N}$ (default $0$).
 
-* **Synchronous update (tie→$G$):** for $v\ne g$,
+* **Synchronous update (tie->$G$):** for $v\ne g$,
 
 $$
   \begin{aligned}
@@ -78,7 +78,7 @@ python showcase.py --demo paper
   Sub‑threshold ($W=2k-1$) can still succeed from *some* starts (checkerboard); the theorem is **worst‑case**.
 * **2D torus grid (4‑neighbor):** $W^*=4$.
 
-**Scaling law (d‑regular):** inbound $d$‑regular graphs report $W^*\approx d$, matching the analytic $W^*=d$.
+**Scaling law (d‑regular):** inbound $d$‑regular graphs report $W^\*\approx d$, matching the analytic $W^\*=d$.
 
 ### 2) Phase diagrams with friction
 
@@ -159,9 +159,9 @@ Optional: `matplotlib`, `numpy`, `networkx` for small plots and benchmarks.
 ## How to read the printed output
 
 * $W^\*$ lines are **exact** via $\max\mathrm{rest}$ or $\max\mathrm{need_tau}$, or **empirical** checks on sampled graphs.
-* “all‑Glory after one step = True/False” is an **actual simulation** with hub pinned and tie→$G$.
-* “Two‑step condition holds?” uses the **sufficient** inequality; it may be `False` even when dynamics succeed (expected).
-* “Per‑node margins” show $\mathrm{hub_weight}(v)+\tau(v)-\mathrm{rest_weight}(v)$; nonnegative margins certify domination.
+* "all‑Glory after one step = True/False” is an **actual simulation** with hub pinned and tie-> $G$.
+* "Two‑step condition holds?" uses the **sufficient** inequality; it may be `False` even when dynamics succeed (expected).
+* "Per‑node margins” show $\mathrm{hub_weight}(v)+\tau(v)-\mathrm{rest_weight}(v)$; nonnegative margins certify domination.
 
 ---
 
