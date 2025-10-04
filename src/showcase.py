@@ -311,6 +311,33 @@ class MajorityHubSim:
             margins[v] = self.hub_weight(v) + int(tau_map.get(v, 0)) - self.rest_weight(v)
         return margins
 
+    # --- Utilities for experiments and benchmarks ---
+    def count_edges(self) -> int:
+        return sum(len(self.inbound.get(v, [])) for v in self.nodes)
+
+    def clone_with_hub_weights(self, by_v: Mapping[Hashable, int]) -> "MajorityHubSim":
+        """Return a new simulator with hub inbound weights set per node v.
+
+        This supports per-node exact sizing demos (non-uniform hub budgets).
+        """
+        inbound2: Dict[Hashable, List[Tuple[Hashable, int]]] = {
+            v: [] for v in self.nodes
+        }
+        for v in self.nodes:
+            for (u, w) in self.inbound.get(v, []):
+                if u == self.g:
+                    # drop existing g edge; we’ll reinsert below
+                    continue
+                inbound2[v].append((u, w))
+        for v in self.nodes:
+            if v == self.g:
+                continue
+            Wv = int(by_v.get(v, 0))
+            if Wv > 0:
+                inbound2[v].append((self.g, Wv))
+        inbound2[self.g] = []
+        return MajorityHubSim(self.nodes, inbound2, self.g, tau=self.tau)
+
 
 def build_ring_with_hub(n: int, k: int = 1, W: int = 0, g: Hashable = "hub") -> MajorityHubSim:
     """Build a k-nearest neighbor ring C_n with a pinned hub."""
@@ -395,6 +422,58 @@ def build_two_cliques_with_bridge(n1: int, n2: int, w_in: int = 3, w_bridge: int
     return MajorityHubSim(nodes, inbound, g)
 
 
+def build_scale_free_with_hub(n: int, m: int = 2, W: int = 0, g: Hashable = "hub", seed: int | None = None) -> MajorityHubSim:
+    """Build a scale-free (Barabási–Albert style) directed graph plus a hub.
+
+    If networkx is available, use `barabasi_albert_graph` to create an undirected skeleton
+    and convert to a directed inbound list by adding both directions (unit weights).
+    Otherwise, fall back to a small custom preferential-attachment builder.
+    """
+    nodes = list(range(n)) + [g]
+    inbound: Dict[Hashable, List[Tuple[Hashable, int]]] = {v: [] for v in nodes}
+    if seed is not None:
+        try:
+            import random
+            random.seed(seed)
+        except Exception:
+            pass
+    used_networkx = False
+    try:
+        import networkx as nx  # type: ignore
+        Gnx = nx.barabasi_albert_graph(n=n, m=max(1, m), seed=seed)
+        for u, v in Gnx.edges():
+            inbound[v].append((u, 1))
+            inbound[u].append((v, 1))
+        used_networkx = True
+    except Exception:
+        # Fallback: simple preferential attachment
+        import random
+        assert n >= max(3, m + 1)
+        targets = list(range(m + 1))  # start with a clique of size m+1
+        for v in range(m + 1):
+            for u in range(m + 1):
+                if u != v:
+                    inbound[v].append((u, 1))
+        degrees = [len(inbound[v]) for v in range(n)]
+        for v in range(m + 1, n):
+            # choose m distinct targets proportional to degree
+            population = list(range(v))
+            weights = [degrees[u] + 1 for u in population]
+            preds = set()
+            while len(preds) < m:
+                preds.add(random.choices(population, weights=weights, k=1)[0])
+            for u in preds:
+                inbound[v].append((u, 1))
+                inbound[u].append((v, 1))
+                degrees[v] += 1
+                degrees[u] += 1
+    if W > 0:
+        for v in range(n):
+            inbound[v].append((g, W))
+    inbound[g] = []
+    return MajorityHubSim(nodes, inbound, g)
+
+
 def checkerboard_ring(n: int) -> Dict[int, str]:
     return {i: (G if (i % 2 == 0) else N) for i in range(n)}
 
@@ -448,6 +527,30 @@ def showcase_kill_checkerboard_grid(w: int = 10, h: int = 6) -> None:
     s1 = sim.run_one_step({**s0, sim.g: G})
     print("t=1:\n" + ascii_grid({k: v for k, v in s1.items() if k != sim.g}, w, h))
     print("Threshold predicted W*={}, used W={}.\n".format(W_star, W_star))
+    # Optional heatmap visualization
+    try:
+        import numpy as np  # type: ignore
+        import matplotlib.pyplot as plt  # type: ignore
+        def to_array(state: Mapping[Tuple[int, int], str]) -> "np.ndarray":
+            arr = np.zeros((h, w), dtype=int)
+            for y in range(h):
+                for x in range(w):
+                    arr[y, x] = 1 if state[(x, y)] == G else 0
+            return arr
+        a0 = to_array(s0)
+        a1 = to_array({k: v for k, v in s1.items() if k != sim.g})
+        fig, axes = plt.subplots(1, 2, figsize=(6, 3))
+        im0 = axes[0].imshow(a0, cmap="Greens", vmin=0, vmax=1)
+        axes[0].set_title("t=0 (G=1)")
+        axes[0].axis("off")
+        im1 = axes[1].imshow(a1, cmap="Greens", vmin=0, vmax=1)
+        axes[1].set_title("t=1 (G=1)")
+        axes[1].axis("off")
+        fig.suptitle("Grid checkerboard kill (heatmaps)")
+        fig.tight_layout()
+        plt.show()
+    except Exception:
+        pass
 
 
 def showcase_k_nearest_ring(n: int = 50, k: int = 3) -> None:
@@ -588,6 +691,74 @@ def showcase_scaling_law_heterogeneous(n: int = 60, density: float = 0.05, max_w
         gap = degmax - W_star
         ratio = degmax / max(1, W_star)
         print(f"Gap = {gap}, ratio = {ratio:.2f}x")
+
+
+def showcase_scale_free_generalization(n: int = 200, m: int = 2, tau: int = 0, seed: int | None = None) -> None:
+    """Show one-shot threshold behavior on scale-free graphs (heterogeneous degrees)."""
+    sim = build_scale_free_with_hub(n=n, m=m, W=0, seed=seed)
+    tau_map = {v: tau for v in sim.nodes}
+    W_star = sim.max_need_tau(tau_map)
+    print("-- Scale-free (BA) family --")
+    print(f"n={n}, m={m}, tau={tau}, exact W*={W_star}")
+    # Try just-below and at-threshold from all-Gnash
+    if W_star > 0:
+        sim_low = build_scale_free_with_hub(n=n, m=m, W=max(0, W_star - 1), seed=seed)
+        s0 = {v: N for v in sim.nodes if v != sim.g}
+        s1 = sim_low.next_state({**s0, sim_low.g: G}, tau_override=tau_map)
+        print(" below threshold success?", sim_low.is_all_glory(s1))
+    sim_at = build_scale_free_with_hub(n=n, m=m, W=W_star, seed=seed)
+    s0 = {v: N for v in sim_at.nodes if v != sim_at.g}
+    s1 = sim_at.next_state({**s0, sim_at.g: G}, tau_override=tau_map)
+    print(" at threshold success?   ", sim_at.is_all_glory(s1))
+    # Optional: quick NetworkX visualization of degree distribution if available
+    try:
+        import networkx as nx  # type: ignore
+        import matplotlib.pyplot as plt  # type: ignore
+        Gnx = nx.Graph()
+        Gnx.add_nodes_from([v for v in sim.nodes if v != sim.g])
+        for v in sim.nodes:
+            if v == sim.g:
+                continue
+            for (u, w) in sim.inbound.get(v, []):
+                if u != sim.g:
+                    Gnx.add_edge(u, v)
+        degs = [d for _, d in Gnx.degree()]
+        plt.figure(figsize=(4, 3))
+        plt.hist(degs, bins=30, alpha=0.7)
+        plt.title("Scale-free degree distribution (non-hub)")
+        plt.xlabel("degree")
+        plt.ylabel("count")
+        plt.tight_layout()
+        plt.show()
+    except Exception:
+        pass
+
+
+def showcase_per_node_exact_sizing_tau(n: int = 200, k: int = 3, tau_easy: int = 0, tau_hard: int = 5, frac_hard: float = 0.3, seed: int | None = None) -> None:
+    """Heterogeneous tau and non-uniform hub weights sized exactly per node.
+
+    - Build a k-nearest ring and assign two tau levels: hard (lower slack) and easy (higher slack).
+    - Set hub inbound to each v as W(v) = max(0, rest_weight(v) - tau(v)).
+    - By nonuniform_pointwise_sufficient, this yields one-step all Glory for any s.
+    """
+    import random
+    if seed is not None:
+        random.seed(seed)
+    sim0 = build_ring_with_hub(n=n, k=k, W=0)
+    nonhubs = [v for v in sim0.nodes if v != sim0.g and isinstance(v, int)]
+    hard = set(random.sample(nonhubs, k=int(round(frac_hard * len(nonhubs)))))
+    tau_map = {v: (tau_hard if v in hard else tau_easy) for v in sim0.nodes}
+    W_by_v = {v: max(0, sim0.rest_weight(v) - int(tau_map.get(v, 0))) for v in sim0.nodes}
+    sim = sim0.clone_with_hub_weights(W_by_v)
+    # Verify domination pointwise
+    assert sim.domination_condition_tau(tau_map)
+    # Try random starts
+    for t in range(3):
+        s0 = {v: (G if random.random() < 0.5 else N) for v in nonhubs}
+        s1 = sim.next_state({**s0, sim.g: G}, tau_override=tau_map)
+        assert sim.is_all_glory(s1)
+    print("-- Per-node exact sizing with heterogeneous tau --")
+    print(f"ring n={n}, k={k}, |hard|={len(hard)}; success in one step for random starts.")
 
 
 
@@ -1073,6 +1244,135 @@ def assert_uniform_hub_threshold(sim: MajorityHubSim, tau_map: Mapping[Hashable,
         assert sim.is_all_glory(s1)
 
 
+# --- benchmarks -------------------------------------------------------------- #
+def bench_next_state(sim: MajorityHubSim, trials: int = 3) -> Tuple[float, float]:
+    """Return (best_seconds, edges_per_second) for next_state on a random state."""
+    import time, random
+    nonhubs = [v for v in sim.nodes if v != sim.g]
+    s = {v: (G if random.random() < 0.5 else N) for v in nonhubs}
+    s[sim.g] = G
+    m = sim.count_edges()
+    best = float("inf")
+    for _ in range(trials):
+        t0 = time.perf_counter()
+        _ = sim.next_state(s)
+        t1 = time.perf_counter()
+        best = min(best, t1 - t0)
+    eps = (m / best) if best > 0 else float("inf")
+    return best, eps
+
+
+def bench_two_step(sim: MajorityHubSim, H: Iterable[Hashable] | None = None, trials: int = 3) -> Tuple[float, float]:
+    """Return (best_seconds, edges_per_second) for two_step_condition_holds."""
+    import time
+    H = list(H or [])
+    tau = {v: 0 for v in sim.nodes}
+    m = sim.count_edges()
+    best = float("inf")
+    for _ in range(trials):
+        t0 = time.perf_counter()
+        _ = sim.two_step_condition_holds(H, tau)
+        t1 = time.perf_counter()
+        best = min(best, t1 - t0)
+    eps = (m / best) if best > 0 else float("inf")
+    return best, eps
+
+
+def bench_run_schedule(sim: MajorityHubSim, trials: int = 3) -> Tuple[float, float]:
+    """Return (best_seconds, edges_per_second) for a full async pass over non-hubs."""
+    import time, random
+    nonhubs = [v for v in sim.nodes if v != sim.g]
+    s = {v: (G if random.random() < 0.5 else N) for v in nonhubs}
+    s[sim.g] = G
+    sched = list(nonhubs)
+    m = sim.count_edges()
+    best = float("inf")
+    for _ in range(trials):
+        random.shuffle(sched)
+        t0 = time.perf_counter()
+        _ = sim.run_schedule(s, sched)
+        t1 = time.perf_counter()
+        best = min(best, t1 - t0)
+    eps = (m / best) if best > 0 else float("inf")
+    return best, eps
+
+
+def bench_suite(kind: str = "ring", n: int = 10_000, k: int = 3, width: int = 200, height: int = 200, seed: int | None = None) -> None:
+    if kind == "ring":
+        sim = build_ring_with_hub(n=n, k=k, W=2 * k)
+        print(f"[graph] ring n={n}, k={k}, edges≈{sim.count_edges()}")
+    elif kind == "grid":
+        sim = build_grid_torus_with_hub(W=4, width=width, height=height)
+        print(f"[graph] grid {width}x{height}, edges≈{sim.count_edges()}")
+    elif kind == "scale-free":
+        sim = build_scale_free_with_hub(n=n, m=max(1, k), W=max(1, 2 * k), seed=seed)
+        print(f"[graph] scale-free n={n}, m={k}, edges≈{sim.count_edges()}")
+    else:
+        raise ValueError("kind must be 'ring', 'grid', or 'scale-free'")
+
+    b, eps = bench_next_state(sim)
+    print(f"[bench] next_state: best={b:.4f}s, {eps:,.0f} edges/s")
+    b, eps = bench_two_step(sim)
+    print(f"[bench] two_step_condition: best={b:.4f}s, {eps:,.0f} edges/s")
+    b, eps = bench_run_schedule(sim)
+    print(f"[bench] run_schedule (one pass): best={b:.4f}s, {eps:,.0f} edges/s")
+
+
+def benchmark_scalability(
+    ks: List[int] | None = None,
+    ns: List[int] | None = None,
+    trials: int = 5,
+    seed: int | None = None,
+) -> None:
+    """Benchmark key operations on rings across n and k, with log-log plots."""
+    import time
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception:
+        plt = None  # type: ignore
+    ks = ks or [1, 2, 3]
+    ns = ns or [100, 500, 1000, 5000, 10_000]
+    results: Dict[str, List[float]] = {"greedy_seed": [], "next_state": [], "run_schedule": []}
+    labels = list(results.keys())
+    for n in ns:
+        times = {op: [] for op in labels}
+        for _ in range(trials):
+            for k in ks:
+                sim = build_ring_with_hub(n=n, k=k, W=max(1, 2 * k - 1))
+                tau_map = {v: 0 for v in sim.nodes}
+                s0 = {v: (G if ((isinstance(v, int) and (v % 2 == 0)) or v == sim.g) else N) for v in sim.nodes}
+                # greedy_seed
+                t0 = time.perf_counter()
+                sim.greedy_seed(tau_map=tau_map, max_seeds=max(1, n // 20))
+                times["greedy_seed"].append(time.perf_counter() - t0)
+                # next_state
+                t0 = time.perf_counter()
+                _ = sim.next_state(s0, tau_override=tau_map)
+                times["next_state"].append(time.perf_counter() - t0)
+                # run_schedule
+                sched = [v for v in sim.nodes if v != sim.g]
+                t0 = time.perf_counter()
+                _ = sim.run_schedule(s0, sched, tau_map=tau_map)
+                times["run_schedule"].append(time.perf_counter() - t0)
+        for op in labels:
+            avg = sum(times[op]) / (trials * len(ks))
+            results[op].append(avg)
+            print(f"n={n:>6}, op={op:12s}: avg time={avg:.4f}s over {trials} trials, ks={ks}")
+    if plt is not None:
+        plt.figure(figsize=(8, 5))
+        for op in labels:
+            plt.plot(ns, results[op], marker='o', label=op)
+        plt.title("Runtime Scaling (Rings, Multi-k)")
+        plt.xlabel("n (nodes)")
+        plt.ylabel("Avg Time (s)")
+        plt.xscale("log")
+        plt.yscale("log")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -1091,7 +1391,21 @@ if __name__ == "__main__":
     )
     parser.add_argument("--n", type=int, default=60, help="ring size for ring demos")
     parser.add_argument("--k", type=int, default=3, help="k-nearest parameter for ring demos")
+    parser.add_argument("--seed", type=int, default=None, help="random seed for demos/benchmarks")
+    # Benchmark flags
+    parser.add_argument("--bench", action="store_true", help="run benchmarks instead of demos")
+    parser.add_argument("--bench-kind", choices=["ring", "grid", "scale-free"], default="ring")
+    parser.add_argument("--width", type=int, default=200, help="grid width for bench")
+    parser.add_argument("--height", type=int, default=200, help="grid height for bench")
+    parser.add_argument("--bench-scale", action="store_true", help="run scaling benchmark suite with plots")
     args = parser.parse_args()
+
+    if args.bench:
+        bench_suite(kind=args.bench_kind, n=args.n, k=args.k, width=args.width, height=args.height, seed=args.seed)
+        raise SystemExit(0)
+    if args.bench_scale:
+        benchmark_scalability(seed=args.seed)
+        raise SystemExit(0)
 
     if args.demo in ("all", "two_step_ring"):
         showcase_two_step_minimal_seeds_ring(n=args.n, k=max(2, args.k))
@@ -1116,6 +1430,8 @@ if __name__ == "__main__":
         phase_uniform_tau_grid(w=10, h=8)
         showcase_scaling_law_regular_topologies()
         showcase_scaling_law_heterogeneous(n=80, density=0.06, max_w=7)
+        showcase_scale_free_generalization(n=200, m=2, tau=0, seed=args.seed)
+        showcase_per_node_exact_sizing_tau(n=120, k=args.k, tau_easy=0, tau_hard=5, frac_hard=0.33, seed=args.seed)
         showcase_scaling_law_community_graph(n1=12, n2=12, w_in=3, w_bridge=1)
         showcase_degmax_gap_extreme(m=200, M=800)
         showcase_multi_hub_budget_split(n=args.n, k=args.k)

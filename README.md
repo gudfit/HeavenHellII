@@ -136,10 +136,23 @@ Two and three‑hub demos split the budget so that $\sum_i W_i\ge W^*$ and succe
   python showcase.py --demo two_step_ring   --n 60 --k 3
   python showcase.py --demo two_hub_split   --n 60 --k 3
   python showcase.py --demo three_hub_split --n 60 --k 3
+  python showcase.py --bench --bench-kind ring --n 10000 --k 3
+  python showcase.py --bench --bench-kind grid --width 200 --height 200
+  python showcase.py --bench --bench-kind scale-free --n 10000 --k 3 --seed 42
+  python showcase.py --bench-scale --seed 42 
+
   ```
 
 **Dependencies:** Python 3.10+; no required external packages.
-Optional: `matplotlib` for small plots.
+
+### Benchmark CLI flags
+
+  - --bench: run bench_suite instead of demos
+  - --bench-kind ring|grid|scale-free, --width/--height for grids
+  - --bench-scale: run the scalability plot harness
+  - --seed to standardize randoms
+
+Optional: `matplotlib`, `numpy`, `networkx` for small plots and benchmarks.
 
 ---
 
@@ -155,3 +168,4 @@ Optional: `matplotlib` for small plots.
 ## One‑paragraph story
 
 We pin an influencer (the hub) to $G$ and ask: **how much weight suffices to flip the network in one shot, adversarially, with ties favoring $G$?** The answer is clean: **match the heaviest non‑hub inbound ($\max\mathrm{rest}$) modulo friction**, giving the scaling laws $W^\*=2k$ on rings, $4$ on grids, and $d$ on $d$‑regular families. With one unit less ($W^\*-1$), a small **certified seed set** yields success in **one more step**. The same inequality controls **asynchronous** one‑pass schedules, and **multiple hubs** simply add their budgets. Degree×weight bounds can be wildly pessimistic; the demos include a **$200\times$** gap. The code prints the exact inequalities behind each conclusion.
+
