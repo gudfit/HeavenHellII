@@ -1,0 +1,1122 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Hashable, Iterable, List, Mapping, Tuple, Set
+
+
+G = "G"  # Glory
+N = "N"  # Gnash
+
+
+@dataclass(frozen=True)
+class Edge:
+    src: Hashable
+    dst: Hashable
+    w: int
+
+
+class MajorityHubSim:
+
+    def __init__(
+        self,
+        nodes: Iterable[Hashable],
+        inbound: Mapping[Hashable, List[Tuple[Hashable, int]]],
+        g: Hashable,
+        tau: Mapping[Hashable, int] | None = None,
+    ) -> None:
+        """Simulator for majority dynamics with a pinned hub and optional per-node tau."""
+        self.nodes: Tuple[Hashable, ...] = tuple(nodes)
+        self.g = g
+        self.inbound: Dict[Hashable, List[Tuple[Hashable, int]]] = {
+            v: list(inbound.get(v, [])) for v in self.nodes
+        }
+        self.tau: Dict[Hashable, int] = {v: 0 for v in self.nodes}
+        if tau:
+            for v, t in tau.items():
+                self.tau[v] = int(t)
+
+    def hub_weight(self, v: Hashable) -> int:
+        return sum(w for u, w in self.inbound.get(v, []) if u == self.g)
+
+    def rest_weight(self, v: Hashable) -> int:
+        return sum(w for u, w in self.inbound.get(v, []) if u != self.g)
+
+    def max_rest(self) -> int:
+        return max((self.rest_weight(v) for v in self.nodes if v != self.g), default=0)
+
+    def w_from(self, H: Iterable[Hashable], v: Hashable) -> int:
+        Hset = set(H)
+        return sum(w for (u, w) in self.inbound.get(v, []) if u != self.g and u in Hset)
+
+    def rest_outside(self, H: Iterable[Hashable], v: Hashable) -> int:
+        Hset = set(H)
+        return sum(
+            w for (u, w) in self.inbound.get(v, []) if u != self.g and u not in Hset
+        )
+
+    def two_step_condition_holds(
+        self, H: Iterable[Hashable], tau_map: Mapping[Hashable, int]
+    ) -> bool:
+        Hset = set(H)
+        Hset.add(self.g)
+        for v in self.nodes:
+            if v == self.g:
+                continue
+            lhs = self.hub_weight(v) + self.w_from(Hset, v) + int(tau_map.get(v, 0))
+            rhs = self.rest_outside(Hset, v)
+            if lhs < rhs:
+                return False
+        return True
+
+    def two_step_deficits(
+        self, H: Iterable[Hashable], tau_map: Mapping[Hashable, int]
+    ) -> Dict[Hashable, int]:
+        """Return per-node shortfall: max(0, rhs - lhs). 0 means condition met."""
+        Hset = set(H)
+        Hset.add(self.g)
+        deficits: Dict[Hashable, int] = {}
+        for v in self.nodes:
+            if v == self.g:
+                continue
+            lhs = self.hub_weight(v) + self.w_from(Hset, v) + int(tau_map.get(v, 0))
+            rhs = self.rest_outside(Hset, v)
+            deficits[v] = max(0, rhs - lhs)
+        return deficits
+
+    def greedy_seed(
+        self,
+        tau_map: Mapping[Hashable, int],
+        H_init: Iterable[Hashable] | None = None,
+        max_seeds: int | None = None,
+        focus_only_deficit: bool = True,
+    ) -> Tuple[List[Hashable], List[Tuple[Hashable, int]]]:
+        """Greedy seed selection to satisfy the two-step condition."""
+        H: List[Hashable] = list(H_init or [])
+        Hset = set(H)
+        history: List[Tuple[Hashable, int]] = []
+        if self.two_step_condition_holds(H, tau_map):
+            return H, history
+        while True:
+            deficits = self.two_step_deficits(H, tau_map)
+            deficit_nodes = {v for v, d in deficits.items() if d > 0}
+            if not deficit_nodes:
+                break
+            best_u = None
+            best_gain = -1
+            for u in self.nodes:
+                if u == self.g or u in Hset:
+                    continue
+                if focus_only_deficit:
+                    gain = sum(
+                        w for v in deficit_nodes for (src, w) in self.inbound.get(v, []) if src == u
+                    )
+                else:
+                    gain = sum(w for v in self.nodes if v != self.g for (src, w) in self.inbound.get(v, []) if src == u)
+                if gain > best_gain:
+                    best_gain = gain
+                    best_u = u
+            if best_u is None or best_gain <= 0:
+                if any(d > 0 for d in deficits.values()):
+                    print("[greedy_seed] No candidate improves deficit; inequality likely infeasible with remaining seeds.")
+                break
+            H.append(best_u)
+            Hset.add(best_u)
+            history.append((best_u, best_gain))
+            if max_seeds is not None and len(H) >= max_seeds:
+                break
+            if self.two_step_condition_holds(H, tau_map):
+                break
+        return H, history
+
+    def apply_seed(self, s: Mapping[Hashable, str], H: Iterable[Hashable]) -> Dict[Hashable, str]:
+        Hset = set(H)
+        s2 = dict(s)
+        for u in Hset:
+            s2[u] = G
+        s2[self.g] = G
+        return s2
+
+    def next_state(self, s: Mapping[Hashable, str], tau_override: Mapping[Hashable, int] | None = None) -> Dict[Hashable, str]:
+        """Compute synchronous next state with pinned hub and tie->Glory.
+
+        Directed inbound weights are used exactly as provided. The update is
+        synchronous (one global step). For asynchronous behavior, use
+        `run_schedule`, which applies `async_update` node-by-node.
+        """
+        s_next: Dict[Hashable, str] = {}
+        for v in self.nodes:
+            if v == self.g:
+                s_next[v] = G
+                continue
+            tau_v = (self.tau if tau_override is None else tau_override).get(v, 0)
+            SG = 0
+            SN = 0
+            for (u, w) in self.inbound.get(v, []):
+                if u == self.g:
+                    SG += w
+                else:
+                    if s[u] == G:
+                        SG += w
+                    else:
+                        SN += w
+            s_next[v] = G if SG + tau_v >= SN else N
+        return s_next
+
+    def next_state_forced(
+        self,
+        s: Mapping[Hashable, str],
+        forced: Set[Hashable],
+        tau_override: Mapping[Hashable, int] | None = None,
+    ) -> Dict[Hashable, str]:
+        """Synchronous next state with a set `forced` always treated as Glory (incl. g).
+
+        Aligns with the MultiHub_Forced Coq model: every node in `forced ∪ {g}`
+        is pinned to Glory for this update and also counted as Glory when
+        contributing inbound weights.
+        """
+        forced = set(forced) | {self.g}
+        s_next: Dict[Hashable, str] = {}
+        tau_map = self.tau if tau_override is None else tau_override
+        for v in self.nodes:
+            if v in forced:
+                s_next[v] = G
+                continue
+            SG = 0
+            SN = 0
+            for (u, w) in self.inbound.get(v, []):
+                if u in forced or s.get(u, N) == G:
+                    SG += w
+                else:
+                    SN += w
+            t = int(tau_map.get(v, 0))
+            s_next[v] = G if SG + t >= SN else N
+        return s_next
+
+    def run_one_step(self, s: Mapping[Hashable, str]) -> Dict[Hashable, str]:
+        return self.next_state(s)
+
+    def is_all_glory(self, s: Mapping[Hashable, str]) -> bool:
+        return all((v == self.g or s[v] == G) for v in self.nodes)
+
+    def need_tau(self, v: Hashable, tau_map: Mapping[Hashable, int]) -> int:
+        if v == self.g:
+            return 0
+        r = self.rest_weight(v)
+        t = int(tau_map.get(v, 0))
+        return max(0, r - t)
+
+    def max_need_tau(self, tau_map: Mapping[Hashable, int]) -> int:
+        return max((self.need_tau(v, tau_map) for v in self.nodes if v != self.g), default=0)
+
+    def argmax_need_tau(self, tau_map: Mapping[Hashable, int]) -> List[Hashable]:
+        m = self.max_need_tau(tau_map)
+        return [v for v in self.nodes if v != self.g and self.need_tau(v, tau_map) == m]
+
+    def indeg_nonhub(self, v: Hashable) -> int:
+        if v == self.g:
+            return 0
+        return sum(1 for (u, w) in self.inbound.get(v, []) if u != self.g and w > 0)
+
+    def max_in_nonhub(self, v: Hashable) -> int:
+        if v == self.g:
+            return 0
+        vals = [w for (u, w) in self.inbound.get(v, []) if u != self.g]
+        return max(vals) if vals else 0
+
+    def indeg_global(self) -> int:
+        return max((self.indeg_nonhub(v) for v in self.nodes if v != self.g), default=0)
+
+    def wmax_global(self) -> int:
+        return max((self.max_in_nonhub(v) for v in self.nodes if v != self.g), default=0)
+
+    def degmax_upper_bound(self) -> int:
+        return self.indeg_global() * self.wmax_global()
+
+    def async_update(self, s: Mapping[Hashable, str], v: Hashable, tau_map: Mapping[Hashable, int] | None = None) -> Dict[Hashable, str]:
+        """Update only node v using the same tie->Glory rule (hub forced G).
+
+        This is the primitive for asynchronous schedules (`run_schedule`).
+        """
+        tau_map = tau_map or self.tau
+        s_next = dict(s)
+        if v == self.g:
+            s_next[v] = G
+            return s_next
+        SG = 0
+        SN = 0
+        for (u, w) in self.inbound.get(v, []):
+            if u == self.g:
+                SG += w
+            else:
+                if s[u] == G:
+                    SG += w
+                else:
+                    SN += w
+        t = int(tau_map.get(v, 0))
+        s_next[v] = G if SG + t >= SN else N
+        s_next[self.g] = G
+        return s_next
+
+    def run_schedule(self, s: Mapping[Hashable, str], sched: Iterable[Hashable], tau_map: Mapping[Hashable, int] | None = None) -> Dict[Hashable, str]:
+        st = dict(s)
+        st[self.g] = G
+        for v in sched:
+            st = self.async_update(st, v, tau_map=tau_map)
+        return st
+
+    def run_schedule_forced(
+        self,
+        s: Mapping[Hashable, str],
+        sched: Iterable[Hashable],
+        forced: Set[Hashable],
+        tau_map: Mapping[Hashable, int] | None = None,
+    ) -> Dict[Hashable, str]:
+        """Asynchronous one-pass with a set `forced` pinned to Glory throughout."""
+        st = dict(s)
+        forced = set(forced) | {self.g}
+        for u in forced:
+            st[u] = G
+        tmap = self.tau if tau_map is None else tau_map
+        for v in sched:
+            if v in forced:
+                st[v] = G
+                continue
+            SG = 0
+            SN = 0
+            for (u, w) in self.inbound.get(v, []):
+                if u in forced or st.get(u, N) == G:
+                    SG += w
+                else:
+                    SN += w
+            st[v] = G if SG + int(tmap.get(v, 0)) >= SN else N
+            for u in forced:
+                st[u] = G
+        return st
+
+    def domination_condition_tau(self, tau_map: Mapping[Hashable, int]) -> bool:
+        """Check hub_weight(v) + tau(v) >= rest_weight(v) for all non-hubs."""
+        for v in self.nodes:
+            if v == self.g:
+                continue
+            if self.hub_weight(v) + int(tau_map.get(v, 0)) < self.rest_weight(v):
+                return False
+        return True
+
+    def per_node_margin_tau(self, tau_map: Mapping[Hashable, int]) -> Dict[Hashable, int]:
+        """Return margin(v) = hub_weight(v) + tau(v) - rest_weight(v) (>=0 ensures success)."""
+        margins: Dict[Hashable, int] = {}
+        for v in self.nodes:
+            if v == self.g:
+                continue
+            margins[v] = self.hub_weight(v) + int(tau_map.get(v, 0)) - self.rest_weight(v)
+        return margins
+
+
+def build_ring_with_hub(n: int, k: int = 1, W: int = 0, g: Hashable = "hub") -> MajorityHubSim:
+    """Build a k-nearest neighbor ring C_n with a pinned hub."""
+    assert n >= 2 and k >= 1 and k < n // 2 + (n % 2)
+    nodes = list(range(n)) + [g]
+    inbound: Dict[Hashable, List[Tuple[Hashable, int]]] = {v: [] for v in nodes}
+    for v in range(n):
+        for d in range(1, k + 1):
+            inbound[v].append(((v - d) % n, 1))
+            inbound[v].append(((v + d) % n, 1))
+        if W > 0:
+            inbound[v].append((g, W))
+    inbound[g] = []
+    return MajorityHubSim(nodes, inbound, g)
+
+
+def build_grid_torus_with_hub(W: int = 0, width: int = 8, height: int = 8, g: Hashable = "hub") -> MajorityHubSim:
+    """Build a 2D torus grid (`width` x `height`), 4-neighbors, unit weights, with a hub.
+
+    Avoids shadowing the identifier `w` used elsewhere for weights by using
+    `width` and `height` for clarity.
+    """
+    assert width >= 2 and height >= 2
+    nodes: List[Hashable] = [(x, y) for y in range(height) for x in range(width)] + [g]
+    inbound: Dict[Hashable, List[Tuple[Hashable, int]]] = {v: [] for v in nodes}
+    for y in range(height):
+        for x in range(width):
+            v = (x, y)
+            nbrs = [
+                ((x - 1) % width, y),
+                ((x + 1) % width, y),
+                (x, (y - 1) % height),
+                (x, (y + 1) % height),
+            ]
+            for u in nbrs:
+                inbound[v].append((u, 1))
+            if W > 0:
+                inbound[v].append((g, W))
+    inbound[g] = []
+    return MajorityHubSim(nodes, inbound, g)
+
+
+def build_random_d_regular_digraph(n: int, d: int, weight: int = 1, g: Hashable = "hub", seed: int | None = None) -> MajorityHubSim:
+    """Build a simple random d-regular-like inbound structure (not strict regularity).
+
+    If `seed` is provided, `random.seed(seed)` ensures reproducibility.
+    """
+    import random
+    if seed is not None:
+        random.seed(seed)
+    assert 1 <= d < n
+    nodes = list(range(n)) + [g]
+    inbound: Dict[Hashable, List[Tuple[Hashable, int]]] = {v: [] for v in nodes}
+    all_nonhub = list(range(n))
+    for v in range(n):
+        preds = random.sample([u for u in all_nonhub if u != v], k=d)
+        for u in preds:
+            inbound[v].append((u, weight))
+    inbound[g] = []
+    return MajorityHubSim(nodes, inbound, g)
+
+
+def build_two_cliques_with_bridge(n1: int, n2: int, w_in: int = 3, w_bridge: int = 1, g: Hashable = "hub") -> MajorityHubSim:
+    """Two dense cliques (complete digraphs without self-loops) bridged by a weak edge."""
+    assert n1 >= 2 and n2 >= 2
+    nodes = list(range(n1 + n2)) + [g]
+    inbound: Dict[Hashable, List[Tuple[Hashable, int]]] = {v: [] for v in nodes}
+    for v in range(n1):
+        for u in range(n1):
+            if u != v:
+                inbound[v].append((u, w_in))
+    for v in range(n1, n1 + n2):
+        for u in range(n1, n1 + n2):
+            if u != v:
+                inbound[v].append((u, w_in))
+    
+    a_star = 0
+    b_star = n1
+    inbound[b_star].append((a_star, w_bridge))
+    inbound[a_star].append((b_star, w_bridge))
+    inbound[g] = []
+    return MajorityHubSim(nodes, inbound, g)
+
+
+def checkerboard_ring(n: int) -> Dict[int, str]:
+    return {i: (G if (i % 2 == 0) else N) for i in range(n)}
+
+
+def checkerboard_grid(w: int, h: int) -> Dict[Tuple[int, int], str]:
+    return {(x, y): (G if ((x + y) % 2 == 0) else N) for y in range(h) for x in range(w)}
+
+
+def ascii_ring(s: Mapping[int, str]) -> str:
+    return "".join("G" if s[i] == G else "N" for i in range(len(s)))
+
+
+def ascii_grid(s: Mapping[Tuple[int, int], str], w: int, h: int) -> str:
+    lines = []
+    for y in range(h):
+        line = []
+        for x in range(w):
+            line.append("G" if s[(x, y)] == G else "N")
+        lines.append("".join(line))
+    return "\n".join(lines)
+
+
+def showcase_kill_checkerboard_ring(n: int = 20, k: int = 1) -> None:
+    """Show the one-step kill on a checkerboard ring."""
+    W_star = 2 * k
+    
+    sim_nohub = build_ring_with_hub(n=n, k=k, W=0)
+    assert sim_nohub.max_rest() == W_star, (sim_nohub.max_rest(), W_star)
+
+    
+    sim = build_ring_with_hub(n=n, k=k, W=W_star)
+
+    s0 = checkerboard_ring(n)
+    print("Ring C_n checkerboard (k={}):".format(k))
+    print("t=0:", ascii_ring(s0))
+    s1 = sim.run_one_step({**s0, sim.g: G})
+    print("t=1:", ascii_ring({i: s1[i] for i in range(n)}))
+    print("Threshold predicted W*={}, used W={}.\n".format(W_star, W_star))
+
+
+def showcase_kill_checkerboard_grid(w: int = 10, h: int = 6) -> None:
+    """Show the one-step kill on a checkerboard 2D torus grid."""
+    W_star = 4
+    sim_nohub = build_grid_torus_with_hub(W=0, width=w, height=h)
+    assert sim_nohub.max_rest() == W_star, (sim_nohub.max_rest(), W_star)
+
+    sim = build_grid_torus_with_hub(W=W_star, width=w, height=h)
+    s0 = checkerboard_grid(w, h)
+    print("Grid {}x{} checkerboard:".format(w, h))
+    print("t=0:\n" + ascii_grid(s0, w, h))
+    s1 = sim.run_one_step({**s0, sim.g: G})
+    print("t=1:\n" + ascii_grid({k: v for k, v in s1.items() if k != sim.g}, w, h))
+    print("Threshold predicted W*={}, used W={}.\n".format(W_star, W_star))
+
+
+def showcase_k_nearest_ring(n: int = 50, k: int = 3) -> None:
+    """Demonstrate the W* = 2k threshold on a k-nearest ring."""
+    W_star = 2 * k
+    sim_nohub = build_ring_with_hub(n=n, k=k, W=0)
+    assert sim_nohub.max_rest() == W_star
+
+    s0 = checkerboard_ring(n)
+    
+    for W in (W_star - 1, W_star):
+        sim = build_ring_with_hub(n=n, k=k, W=W)
+        s1 = sim.run_one_step({**s0, sim.g: G})
+        allG = sim.is_all_glory(s1)
+        print(f"k-nearest ring (k={k}), W={W}: all-Glory after one step = {allG}")
+
+
+
+
+def phase_uniform_tau_ring(n: int = 50, k: int = 3, t_max: int | None = None) -> None:
+    """Compute and display W*(t) = max_v max(0, rest(v) - t) for uniform tau=t."""
+    sim = build_ring_with_hub(n=n, k=k, W=0)
+    max_rest = sim.max_rest()
+    if t_max is None:
+        t_max = max_rest + 3
+    data: List[Tuple[int, int]] = []
+    last = None
+    for t in range(0, t_max + 1):
+        tau = {v: t for v in sim.nodes}
+        w_star = sim.max_need_tau(tau)
+        data.append((t, w_star))
+        if last is not None:
+            assert w_star <= last, "tau_monotone violated (should be nonincreasing)"
+        last = w_star
+    print(f"Uniform tau on ring (n={n}, k={k}). max_rest={max_rest}.")
+    print("t\tW*(t)")
+    for t, w_star in data:
+        print(f"{t}\t{w_star}")
+    
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+
+        ts = [t for t, _ in data]
+        ws = [w for _, w in data]
+        plt.figure(figsize=(4, 3))
+        plt.step(ts, ws, where="post")
+        plt.title(f"Phase: W* vs tau (ring k={k})")
+        plt.xlabel("uniform tau")
+        plt.ylabel("W* (min uniform hub weight)")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+    except Exception:
+        pass
+
+
+def phase_uniform_tau_grid(w: int = 10, h: int = 8, t_max: int | None = None) -> None:
+    """Uniform tau phase curve on 4-neighbor torus grid: W*(t) = max(0, 4 - t)."""
+    sim = build_grid_torus_with_hub(W=0, width=w, height=h)
+    max_rest = sim.max_rest()  
+    if t_max is None:
+        t_max = max_rest + 3
+    data = []
+    last = None
+    for t in range(0, t_max + 1):
+        tau = {v: t for v in sim.nodes}
+        w_star = sim.max_need_tau(tau)
+        data.append((t, w_star))
+        if last is not None:
+            assert w_star <= last
+        last = w_star
+    print(f"Uniform tau on grid ({w}x{h}). max_rest={max_rest}.")
+    print("t\tW*(t)")
+    for t, w_star in data:
+        print(f"{t}\t{w_star}")
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+        ts = [t for t, _ in data]
+        ws = [w for _, w in data]
+        plt.figure(figsize=(4, 3))
+        plt.step(ts, ws, where="post")
+        plt.title("Phase: W* vs tau (grid)")
+        plt.xlabel("uniform tau")
+        plt.ylabel("W* (min uniform hub weight)")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+    except Exception:
+        pass
+
+
+def showcase_scaling_law_regular_topologies(seed: int | None = None) -> None:
+    """d-regular families: ring, grid, and random d-regular digraphs."""
+    import random
+    if seed is not None:
+        random.seed(seed)
+    # Ring k-nearest: d = 2k
+    print("-- Regular families --")
+    for k in [1, 2, 3]:
+        sim = build_ring_with_hub(n=60, k=k, W=0)
+        d = sim.max_rest()  # equals 2k
+        tau = 0
+        w_star = sim.max_need_tau({v: tau for v in sim.nodes})
+        print(f"Ring: k={k}, degree d={d}, W* (tau=0)={w_star}")
+    # Grid 4-neighbor: d = 4
+    simg = build_grid_torus_with_hub(W=0, width=10, height=8)
+    dg = simg.max_rest()
+    w_star_g = simg.max_need_tau({v: 0 for v in simg.nodes})
+    print(f"Grid: d={dg}, W* (tau=0)={w_star_g}")
+    
+    for d in [3, 5]:
+        simd = build_random_d_regular_digraph(n=80, d=d, seed=seed)
+        w_star_d = simd.max_need_tau({v: 0 for v in simd.nodes})
+        print(f"Random d-regular-like: d≈{d}, measured W*≈{w_star_d}")
+
+
+def showcase_scaling_law_heterogeneous(n: int = 60, density: float = 0.05, max_w: int = 5, seed: int | None = None) -> None:
+    """Heterogeneous weighted digraph: exact W* vs the degmax upper bound."""
+    import random
+    if seed is not None:
+        random.seed(seed)
+    nodes = list(range(n)) + ["hub"]
+    g = "hub"
+    inbound: Dict[Hashable, List[Tuple[Hashable, int]]] = {v: [] for v in nodes}
+    for v in range(n):
+        for u in range(n):
+            if u == v:
+                continue
+            if random.random() < density:
+                inbound[v].append((u, random.randint(1, max_w)))
+    sim = MajorityHubSim(nodes, inbound, g)
+    W_star = sim.max_rest()
+    degmax = sim.degmax_upper_bound()
+    print("-- Heterogeneous weighted graph --")
+    print(f"Exact W* = max_rest = {W_star}")
+    print(f"Upper bound indeg_global*wmax_global = {degmax}")
+    if degmax > 0:
+        gap = degmax - W_star
+        ratio = degmax / max(1, W_star)
+        print(f"Gap = {gap}, ratio = {ratio:.2f}x")
+
+
+
+
+def explain_node_update(sim: MajorityHubSim,
+                        s: Mapping[Hashable, str],
+                        v: Hashable,
+                        tau_map: Mapping[Hashable, int] | None = None,
+                        forced: Iterable[Hashable] = ()) -> None:
+    """Print SG, SN, hub_weight, rest_weight, tau(v), and the decision at node v."""
+    tau_map = tau_map or sim.tau
+    forced = set(forced) | {sim.g}
+    SG = 0; SN = 0
+    for (u, w) in sim.inbound.get(v, []):
+        if u in forced or s.get(u, N) == G:
+            SG += w
+        else:
+            SN += w
+    print(f"v={v}   SG={SG}   SN={SN}   tau={tau_map.get(v,0)}   "
+          f"hub_weight={sim.hub_weight(v)}   rest_weight={sim.rest_weight(v)}   "
+          f"decision={'G' if SG + int(tau_map.get(v,0)) >= SN else 'N'}")
+
+
+def exhaustive_uniform_hub_check(n: int, k: int) -> None:
+    """Exhaustive over all 2^n initial states (small n) to verify:
+       - For W >= 2k: one step -> all Glory, for *all* s
+       - For W = 2k-1: there exists s with failure (we exhibit all-Gnash)
+    """
+    from itertools import product
+    sim_at = lambda W: build_ring_with_hub(n=n, k=k, W=W)
+    W_star = 2 * k
+
+    
+    sim_low = sim_at(W_star - 1)
+    s_allN = {v: N for v in range(n)}
+    s1 = sim_low.next_state({**s_allN, sim_low.g: G})
+    assert not sim_low.is_all_glory(s1), "Below threshold unexpectedly succeeded"
+
+    
+    sim_star = sim_at(W_star)
+    for bits in product([G, N], repeat=n):
+        s = {i: bits[i] for i in range(n)}
+        s1 = sim_star.next_state({**s, sim_star.g: G})
+        assert sim_star.is_all_glory(s1), f"At threshold failed for s={bits}"
+    print(f"[exhaustive check] ring n={n}, k={k} passed necessity & sufficiency.")
+
+
+def assert_two_cliques_rest(sim: MajorityHubSim, n1: int, n2: int,
+                            w_in: int, w_bridge: int) -> None:
+    """Verify analytic rest weights in the two-clique + bridge graph."""
+    a_star, b_star = 0, n1
+    for v in range(n1):
+        expected = (n1 - 1) * w_in + (w_bridge if v == a_star else 0)
+        assert sim.rest_weight(v) == expected
+    for v in range(n1, n1 + n2):
+        expected = (n2 - 1) * w_in + (w_bridge if v == b_star else 0)
+        assert sim.rest_weight(v) == expected
+
+
+def showcase_scaling_law_community_graph(n1: int = 12, n2: int = 12, w_in: int = 3, w_bridge: int = 1) -> None:
+    """Two-clique community graph: bottleneck nodes control the threshold."""
+    sim = build_two_cliques_with_bridge(n1=n1, n2=n2, w_in=w_in, w_bridge=w_bridge)
+    W_star = sim.max_rest()
+    rest_vals = {v: sim.rest_weight(v) for v in sim.nodes if v != sim.g}
+    max_nodes = [v for v, r in rest_vals.items() if r == W_star]
+    print("-- Community graph (two cliques + weak bridge) --")
+    print(f"W* = max_rest = {W_star}")
+    print(f"Nodes achieving max_rest (bottleneck candidates): {max_nodes}")
+    try:
+        assert_two_cliques_rest(sim, n1=n1, n2=n2, w_in=w_in, w_bridge=w_bridge)
+        print("rest_weight formula: verified")
+    except AssertionError:
+        print("rest_weight formula: verification FAILED")
+    sample = list(range(min(6, n1))) + list(range(n1, n1 + min(6, n2)))
+    print("rest_weight samples:")
+    print(" ".join(f"{v}:{rest_vals[v]}" for v in sample))
+
+
+def phase_heterogeneous_tau_two_communities(
+    n: int = 60, k: int = 2, frac_hard: float = 0.3, tau_hard: int = 0, tau_easy: int = 5
+) -> None:
+    """Heterogeneous tau: one hard-to-flip community controls the threshold."""
+    assert 0.0 < frac_hard < 1.0
+    H = max(1, min(n - 1, int(round(frac_hard * n))))
+    sim = build_ring_with_hub(n=n, k=k, W=0)
+    tau = {v: (tau_hard if (isinstance(v, int) and v < H) else tau_easy) for v in sim.nodes}
+    w_star = sim.max_need_tau(tau)
+    argmax_nodes = sim.argmax_need_tau(tau)
+    hard_set = set(range(H))
+    hard_dominates = any((v in hard_set) for v in argmax_nodes if isinstance(v, int))
+    print(f"Heterogeneous tau on ring (n={n}, k={k}). hard_fraction={frac_hard:.2f}")
+    print(f"tau_hard={tau_hard}, tau_easy={tau_easy}")
+    print(f"W* (tau) = {w_star}")
+    print(f"Argmax nodes (sample up to 10): {argmax_nodes[:10]}")
+    print("Controlling community:", "hard" if hard_dominates else "easy")
+
+    s0 = checkerboard_ring(n)
+    for W in [max(0, w_star - 1), w_star]:
+        simW = build_ring_with_hub(n=n, k=k, W=W)
+        s1 = simW.next_state({**s0, simW.g: G}, tau_override=tau)
+        ok = simW.is_all_glory(s1)
+        print(f"One-step all-Glory at W={W}? {ok}")
+
+
+def showcase_greedy_seeding_two_step(
+    n: int = 40, k: int = 2, W: int | None = None, tau: int = 0, max_seeds: int | None = 5
+) -> None:
+    """Start below one-step threshold; add a few seeds to guarantee two-step."""
+    if W is None:
+        W = max(0, 2 * k - 1)  
+    sim = build_ring_with_hub(n=n, k=k, W=W)
+    tau_map = {v: tau for v in sim.nodes}
+    print(f"Greedy seeding on ring (n={n}, k={k}), W={W} < 2k={2*k}? {'YES' if W < 2*k else 'NO'}")
+    s0 = checkerboard_ring(n)
+    s1 = sim.run_one_step({**s0, sim.g: G})
+    outcome = sim.is_all_glory(s1)
+    print(f"One-step all-Glory without seeds = {outcome}")
+    if W < 2 * k:
+        print("  (Reminder: W*=2k is a worst-case guarantee; sub-threshold can still")
+        print("   succeed from specific starts like checkerboard. The two-step check is")
+        print("   sufficient, not necessary, so it may print False while dynamics succeed.)")
+
+    H, hist = sim.greedy_seed(tau_map=tau_map, H_init=[], max_seeds=max_seeds)
+    deficits = sim.two_step_deficits(H, tau_map)
+    print(f"Selected seeds ({len(H)}): {H}")
+    print("Two-step condition holds?", sim.two_step_condition_holds(H, tau_map))
+    marks = ["G" if deficits[i] == 0 else "!" for i in range(n)]
+    print("Per-node condition (G ok, ! deficit):")
+    print("".join(marks))
+
+    s_seeded = sim.apply_seed({**s0, sim.g: G}, H)
+    s2 = sim.next_state(s_seeded, tau_override=tau_map)
+    print("After seeding + one step, all-Glory?", sim.is_all_glory(s2))
+
+
+
+from typing import Hashable as _Hashable  
+
+
+def build_gap_graph(m: int = 120, M: int = 500, g: _Hashable = "hub") -> MajorityHubSim:
+    """
+    Adversarial graph with a huge gap between the degmax upper bound and the exact threshold.
+    - Node 0: one heavy inbound edge of weight M from node 1  --> pushes wmax_global up to M.
+    - Node 2: inbound from nodes 3..(m+2), each weight 1      --> pushes indeg_global up to m.
+    Result:  max_rest ~ max(M, m)  but  indeg_global*wmax_global ~ m*M  >> max_rest.
+    """
+    n = m + 3
+    nodes = list(range(n)) + [g]
+    inbound: Dict[_Hashable, List[Tuple[_Hashable, int]]] = {v: [] for v in nodes}
+
+    inbound[0].append((1, M))
+    for u in range(3, m + 3):
+        inbound[2].append((u, 1))
+
+    inbound[1].append((0, 1))
+    inbound[3].append((2, 1))
+    inbound[g] = []
+    return MajorityHubSim(nodes, inbound, g)
+
+
+def showcase_degmax_gap_extreme(m: int = 120, M: int = 500) -> None:
+    """Show an extreme gap between the degmax upper bound and exact W*."""
+    sim = build_gap_graph(m=m, M=M)
+    W_star = sim.max_rest()
+    degmax = sim.degmax_upper_bound()
+    ratio = (degmax / max(1, W_star)) if W_star > 0 else float("inf")
+    print("-- Extreme degmax gap example --")
+    print(f"Parameters: m={m} (large indegree), M={M} (large max weight)")
+    print(f"Exact W* = max_rest = {W_star}")
+    print(f"Upper bound indeg_global*wmax_global = {degmax}")
+    print(f"Ratio bound/exact = {ratio:.2f}x")
+
+
+def build_ring_with_two_hubs(
+    n: int,
+    k: int,
+    W_each: int,
+    hubs: Tuple[_Hashable, _Hashable] = ("hub1", "hub2"),
+) -> MajorityHubSim:
+    """
+    Ring C_n with two hubs h1,h2. Each hub contributes W_each into every non-hub.
+    We return a MajorityHubSim with g=h1; h2 is just another node whose state we seed to G.
+    """
+    h1, h2 = hubs
+    nodes = list(range(n)) + [h1, h2]
+    inbound: Dict[_Hashable, List[Tuple[_Hashable, int]]] = {v: [] for v in nodes}
+    for v in range(n):
+        for d in range(1, k + 1):
+            inbound[v].append(((v - d) % n, 1))
+            inbound[v].append(((v + d) % n, 1))
+        if W_each > 0:
+            inbound[v].append((h1, W_each))
+            inbound[v].append((h2, W_each))
+    inbound[h1] = []
+    inbound[h2] = []
+    return MajorityHubSim(nodes, inbound, g=h1)
+
+
+def showcase_multi_hub_budget_split(n: int = 60, k: int = 3) -> None:
+    """
+    Two hubs each with W_each = k on a k-nearest ring (so W* = 2k).
+    - Single-hub with W=k can fail from all-Gnash (tight counterexample on rings).
+    - Two hubs, each W=k, together succeed in one synchronous step from all-Gnash.
+    """
+    W_star = 2 * k
+    W_each = k
+    sim_single = build_ring_with_hub(n=n, k=k, W=W_each)
+    s_allN = {v: N for v in range(n)}
+    s1_single = sim_single.next_state({**s_allN, sim_single.g: G})
+    ok_single = sim_single.is_all_glory(s1_single)
+    print("-- Multi-hub budget split on ring --")
+    print(f"Single hub: k={k}, W_each={W_each}, W*={W_star} -> all Glory from all-Gnash? {ok_single}")
+
+    sim_two = build_ring_with_two_hubs(n=n, k=k, W_each=W_each, hubs=("h1", "h2"))
+    s_seed = {**s_allN, "h1": G, "h2": G}
+    s1_two = sim_two.next_state_forced(s_seed, forced={"h1", "h2"})
+    ok_two = sim_two.is_all_glory(s1_two)
+    print(f"Two hubs: each W={W_each} (sum=W*) -> all Glory from all-Gnash? {ok_two}")
+
+
+def build_ring_with_three_hubs(
+    n: int,
+    k: int,
+    W_each: Tuple[int, int, int],
+    hubs: Tuple[_Hashable, _Hashable, _Hashable] = ("h1", "h2", "h3"),
+) -> MajorityHubSim:
+    """
+    Ring C_n with three hubs h1,h2,h3. Each hub i contributes W_each[i] into every non-hub.
+    We return a MajorityHubSim with g=h1; h2,h3 are regular nodes we will seed to G.
+    """
+    h1, h2, h3 = hubs
+    w1, w2, w3 = W_each
+    nodes = list(range(n)) + [h1, h2, h3]
+    inbound: Dict[_Hashable, List[Tuple[_Hashable, int]]] = {v: [] for v in nodes}
+    for v in range(n):
+        for d in range(1, k + 1):
+            inbound[v].append(((v - d) % n, 1))
+            inbound[v].append(((v + d) % n, 1))
+        if w1 > 0:
+            inbound[v].append((h1, w1))
+        if w2 > 0:
+            inbound[v].append((h2, w2))
+        if w3 > 0:
+            inbound[v].append((h3, w3))
+    inbound[h1] = []
+    inbound[h2] = []
+    inbound[h3] = []
+    return MajorityHubSim(nodes, inbound, g=h1)
+
+
+def showcase_three_hub_budget_split(n: int = 60, k: int = 3) -> None:
+    """
+    Three hubs splitting the exact one-shot budget on a k-nearest ring.
+    Each hub gets at least floor(W*/3); we distribute the remainder so the sum is >= W*.
+    All three hubs are seeded to G, showing one-shot success from all-Gnash.
+    """
+    W_star = 2 * k
+    base = W_star // 3
+    rem = W_star - 3 * base
+    W_each = (base + (1 if 0 < rem else 0), base + (1 if 1 < rem else 0), base)
+    total = sum(W_each)
+    sim = build_ring_with_three_hubs(n=n, k=k, W_each=W_each, hubs=("h1", "h2", "h3"))
+    s_allN = {v: N for v in range(n)}
+    s_seed = {**s_allN, "h1": G, "h2": G, "h3": G}
+    s1 = sim.next_state_forced(s_seed, forced={"h1", "h2", "h3"})
+    ok = sim.is_all_glory(s1)
+    print("-- Three-hub budget split on ring --")
+    print(f"k={k}, W*={W_star}, split per hub = {W_each} (sum={total})")
+    print(f"All Glory from all-Gnash with all three hubs seeded? {ok}")
+
+
+
+
+def periodic_seed_cover_ring(
+    n: int, k: int, offset: int = 0, spacing: int | None = None
+) -> List[int]:
+    """
+    Periodic seed set on a k-nearest ring.
+    For the two-step sufficient condition with W = 2k-1 and tau = 0 to hold
+    for every node (including seeds), each node must have at least one other
+    seed within distance <= k. The simple certified choice is spacing = k.
+
+    spacing:
+      - If None, defaults to spacing = k (certified).
+      - You may pass a smaller spacing (<= k) to be even more conservative.
+    """
+    p = spacing if spacing is not None else k
+    assert 1 <= p <= k, "For certified two-step inequality, require spacing <= k."
+    return sorted({(offset + i) % n for i in range(0, n, p)})
+
+
+def alternating_k_2k_seed_cover_ring(n: int, k: int, offset: int = 0) -> List[int]:
+    """
+    Optional: a sparser periodic-but-alternating pattern with gaps k, 2k, k, 2k, ...
+    This satisfies the two constraints:
+      (i) max gap <= 2k  (so every non-seed has a seeded neighbor within k), and
+      (ii) no seed is flanked by two gaps > k  (so every seed has some seed within k).
+    It reduces seed count relative to spacing=k (~ every 1.5k on average).
+    """
+    if 2 * k > n:
+        return periodic_seed_cover_ring(n, k, offset=offset, spacing=k)
+    pos = offset % n
+    H = [pos]
+    step = [k, 2 * k]
+    i = 0
+    while True:
+        pos = (pos + step[i % 2]) % n
+        if pos == H[0]:
+            break
+        H.append(pos)
+        i += 1
+    return sorted(set(H))
+
+
+def showcase_two_step_minimal_seeds_ring(n: int = 60, k: int = 2) -> None:
+    """
+    Certified two-step guarantee with periodic seeds at spacing k when W = 2k-1, tau = 0.
+    This guarantees the sufficient inequality holds for every node (worst-case start).
+    Also prints an optional alternating k/2k pattern which is sparser but still certified.
+    """
+    W = 2 * k - 1
+    sim = build_ring_with_hub(n=n, k=k, W=W)
+    tau_map = {v: 0 for v in sim.nodes}
+
+    H_k = periodic_seed_cover_ring(n, k, spacing=k)
+    ok_k = sim.two_step_condition_holds(H_k, tau_map)
+    H_alt = alternating_k_2k_seed_cover_ring(n, k)
+    ok_alt = sim.two_step_condition_holds(H_alt, tau_map)
+
+    print("-- Certified two-step seeds on ring --")
+    print(f"n={n}, k={k}, W={W}")
+    print(f" spacing=k:     |H|={len(H_k):>3} -> inequality holds? {ok_k}")
+    print(f" alternating:   |H|={len(H_alt):>3} -> inequality holds? {ok_alt}")
+
+    s0 = checkerboard_ring(n)
+    for label, H in [("spacing=k", H_k), ("alternating", H_alt)]:
+        s_seeded = sim.apply_seed({**s0, sim.g: G}, H)
+        s1 = sim.next_state(s_seeded, tau_override=tau_map)
+        print(f"  {label:11s} -> all Glory after seed+1 step? {sim.is_all_glory(s1)}")
+
+
+def showcase_async_one_pass_fairness_ring(
+    n: int = 40, k: int = 2, tau: int = 0, trials: int = 5, seed: int | None = None
+) -> None:
+    """Demonstrate that any one-pass schedule covering all non-hubs works."""
+    import random
+    if seed is not None:
+        random.seed(seed)
+
+    W = max(0, 2 * k - tau)
+    sim = build_ring_with_hub(n=n, k=k, W=W)
+    tau_map = {v: tau for v in sim.nodes}
+    assert sim.domination_condition_tau(tau_map), "Domination condition must hold"
+
+    nonhubs = [v for v in sim.nodes if v != sim.g and isinstance(v, int)]
+    
+    s0 = {v: (G if random.random() < 0.5 else N) for v in nonhubs}
+    print(f"Async fairness on ring: n={n}, k={k}, tau={tau}, W={W}")
+    ok_all = True
+    for t in range(trials):
+        order = nonhubs[:]
+        random.shuffle(order)
+        sT = sim.run_schedule({**s0, sim.g: G}, order, tau_map=tau_map)
+        ok = sim.is_all_glory(sT)
+        print(f" trial {t+1}: order covers all once -> all Glory = {ok}")
+        ok_all = ok_all and ok
+    print("All trials succeeded?", ok_all)
+
+
+def showcase_async_one_pass_fairness_grid(width: int = 8, height: int = 6, tau: int = 1, trials: int = 5, seed: int | None = None) -> None:
+    """Same demonstration on a 2D torus grid with 4-neighbors."""
+    import random
+    if seed is not None:
+        random.seed(seed)
+
+    rest = 4
+    W = max(0, rest - tau)
+    sim = build_grid_torus_with_hub(W=W, width=width, height=height)
+    tau_map = {v: tau for v in sim.nodes}
+    assert sim.domination_condition_tau(tau_map)
+    nonhubs = [(x, y) for y in range(height) for x in range(width)]
+    s0 = {(x, y): (G if random.random() < 0.5 else N) for (x, y) in nonhubs}
+    print(f"Async fairness on grid: {width}x{height}, tau={tau}, W={W}")
+    ok_all = True
+    for t in range(trials):
+        order = nonhubs[:]
+        random.shuffle(order)
+        sT = sim.run_schedule({**s0, sim.g: G}, order, tau_map=tau_map)
+        ok = sim.is_all_glory(sT)
+        print(f" trial {t+1}: order covers all once -> all Glory = {ok}")
+        ok_all = ok_all and ok
+    print("All trials succeeded?", ok_all)
+
+
+def showcase_async_three_schedules_ring(n: int = 30, k: int = 2, tau: int = 0, seed: int | None = None) -> None:
+    """Run three very different one-pass schedules; all end Glory under domination."""
+    import random
+    if seed is not None:
+        random.seed(seed)
+
+    W = max(0, 2 * k - tau)
+    sim = build_ring_with_hub(n=n, k=k, W=W)
+    tau_map = {v: tau for v in sim.nodes}
+    assert sim.domination_condition_tau(tau_map)
+    nonhubs = [v for v in sim.nodes if v != sim.g and isinstance(v, int)]
+
+    margins = sim.per_node_margin_tau(tau_map)
+    print(f"Per-node margins (v: margin):")
+    print(" ".join(f"{v}:{margins[v]}" for v in range(n)))
+
+    s0 = {v: N for v in nonhubs}  
+    schedules = [
+        ("increasing", nonhubs[:]),
+        ("reverse", list(reversed(nonhubs))),
+        ("random", random.sample(nonhubs, k=len(nonhubs))),
+    ]
+    for name, order in schedules:
+        sT = sim.run_schedule({**s0, sim.g: G}, order, tau_map=tau_map)
+        ok = sim.is_all_glory(sT)
+        print(f" schedule={name:10s} -> all Glory = {ok}")
+
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+
+        xs = list(range(n))
+        ys = [margins[i] for i in xs]
+        plt.figure(figsize=(5, 2.5))
+        plt.bar(xs, ys, color=["#2ca02c" if y >= 0 else "#d62728" for y in ys])
+        plt.axhline(0, color="black", linewidth=1)
+        plt.title("Domination margins (hub + tau − rest)")
+        plt.xlabel("node")
+        plt.ylabel("margin")
+        plt.tight_layout()
+        plt.show()
+    except Exception:
+        pass
+
+
+def showcase_tight_counterexample_ring(n: int = 40, k: int = 2, tau: int = 0) -> None:
+    """Exhibit a witness v when W < max_need_tau: next(all_gnash)[v] = Gnash."""
+    sim0 = build_ring_with_hub(n=n, k=k, W=0)
+    tau_map = {v: tau for v in sim0.nodes}
+    W_star = sim0.max_need_tau(tau_map)
+    print(f"Tight counterexample on ring (n={n}, k={k}, tau={tau})")
+    print(f" max_need_tau W* = {W_star}")
+    if W_star == 0:
+        print(" Trivial regime: W* = 0, no counterexample below threshold.")
+        return
+    W = W_star - 1
+    simW = build_ring_with_hub(n=n, k=k, W=W)
+    argmax_nodes = sim0.argmax_need_tau(tau_map)
+    witness = argmax_nodes[0]
+    s0 = {v: N for v in range(n)}
+    s1 = simW.next_state({**s0, simW.g: G}, tau_override=tau_map)
+    result = s1[witness]
+    print(f" choose W = W* - 1 = {W}; witness v={witness}; next(all_gnash)[v]={result}")
+    print(" expected Gnash ->", result == N)
+
+
+def assert_uniform_hub_threshold(sim: MajorityHubSim, tau_map: Mapping[Hashable, int]) -> None:
+    """Smoke test: if the hub has uniform inbound edge weight W* into every non-hub,
+    then for arbitrary initial states, one synchronous step yields all-Glory."""
+    import random
+
+    W_star = sim.max_need_tau(tau_map)
+
+    def hub_uniform_Wstar() -> bool:
+        for v in sim.nodes:
+            if v == sim.g:
+                continue
+            w_from_g = [wt for (u, wt) in sim.inbound.get(v, []) if u == sim.g]
+            if len(w_from_g) != 1 or w_from_g[0] != W_star:
+                return False
+        return True
+
+    if not hub_uniform_Wstar():
+        return
+
+    nonhubs = [v for v in sim.nodes if v != sim.g]
+    for _ in range(50):
+        s0 = {v: (G if random.random() < 0.5 else N) for v in nonhubs}
+        s1 = MajorityHubSim(sim.nodes, sim.inbound, sim.g).next_state({**s0, sim.g: G}, tau_override=tau_map)
+        assert sim.is_all_glory(s1)
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Heaven-Hell showcase runner")
+    parser.add_argument(
+        "--demo",
+        choices=[
+            "all",                
+            "paper",              
+            "two_step_ring",
+            "two_hub_split",
+            "three_hub_split",
+        ],
+        default="all",
+        help="Which showcase to run (default: all)",
+    )
+    parser.add_argument("--n", type=int, default=60, help="ring size for ring demos")
+    parser.add_argument("--k", type=int, default=3, help="k-nearest parameter for ring demos")
+    args = parser.parse_args()
+
+    if args.demo in ("all", "two_step_ring"):
+        showcase_two_step_minimal_seeds_ring(n=args.n, k=max(2, args.k))
+
+    if args.demo in ("all", "two_hub_split"):
+        showcase_multi_hub_budget_split(n=args.n, k=args.k)
+
+    if args.demo in ("all", "three_hub_split"):
+        showcase_three_hub_budget_split(n=args.n, k=args.k)
+
+    if args.demo == "paper":
+        showcase_kill_checkerboard_ring(n=20, k=1)
+        showcase_kill_checkerboard_grid(w=10, h=6)
+        showcase_k_nearest_ring(n=max(10, args.n), k=args.k)
+        phase_uniform_tau_ring(n=args.n, k=args.k)
+        phase_heterogeneous_tau_two_communities(n=args.n, k=args.k, frac_hard=0.33, tau_hard=0, tau_easy=5)
+        showcase_greedy_seeding_two_step(n=40, k=max(2, args.k), W=2*max(2, args.k)-1, tau=0, max_seeds=4)
+        showcase_async_one_pass_fairness_ring(n=args.n, k=args.k, tau=0, trials=3)
+        showcase_async_one_pass_fairness_grid(width=8, height=6, tau=1, trials=3)
+        showcase_async_three_schedules_ring(n=30, k=args.k, tau=0)
+        showcase_tight_counterexample_ring(n=40, k=args.k, tau=0)
+        phase_uniform_tau_grid(w=10, h=8)
+        showcase_scaling_law_regular_topologies()
+        showcase_scaling_law_heterogeneous(n=80, density=0.06, max_w=7)
+        showcase_scaling_law_community_graph(n1=12, n2=12, w_in=3, w_bridge=1)
+        showcase_degmax_gap_extreme(m=200, M=800)
+        showcase_multi_hub_budget_split(n=args.n, k=args.k)
+        showcase_three_hub_budget_split(n=args.n, k=args.k)
