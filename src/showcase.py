@@ -34,6 +34,18 @@ class MajorityHubSim:
         if tau:
             for v, t in tau.items():
                 self.tau[v] = int(t)
+        # Lazy NumPy structures (built on first use)
+        self._np_ready: bool = False
+        self._nonhubs: Tuple[Hashable, ...] | None = None
+        self._idx_of: Dict[Hashable, int] | None = None
+        self._edge_src_idx = None
+        self._edge_dst_idx = None
+        self._edge_w = None
+        self._rest_nonhub_arr = None
+        self._hub_w_arr = None
+        self._out_ptr = None
+        self._out_dst = None
+        self._out_w = None
 
     def hub_weight(self, v: Hashable) -> int:
         return sum(w for u, w in self.inbound.get(v, []) if u == self.g)
@@ -91,42 +103,131 @@ class MajorityHubSim:
         focus_only_deficit: bool = True,
     ) -> Tuple[List[Hashable], List[Tuple[Hashable, int]]]:
         """Greedy seed selection to satisfy the two-step condition."""
-        H: List[Hashable] = list(H_init or [])
-        Hset = set(H)
-        history: List[Tuple[Hashable, int]] = []
-        if self.two_step_condition_holds(H, tau_map):
-            return H, history
-        while True:
-            deficits = self.two_step_deficits(H, tau_map)
-            deficit_nodes = {v for v, d in deficits.items() if d > 0}
-            if not deficit_nodes:
-                break
-            best_u = None
-            best_gain = -1
-            for u in self.nodes:
-                if u == self.g or u in Hset:
+        # Fast NumPy path with vectorized gain computation (falls back if NumPy unavailable)
+        try:
+            import numpy as np  # type: ignore
+            self._ensure_numpy()
+            nonhubs = self._nonhubs  # type: ignore
+            idx_of = self._idx_of  # type: ignore
+            edge_src = self._edge_src_idx  # type: ignore
+            edge_dst = self._edge_dst_idx  # type: ignore
+            edge_w = self._edge_w  # type: ignore
+            rest_arr = self._rest_nonhub_arr  # type: ignore
+            hub_arr = self._hub_w_arr  # type: ignore
+
+            H: List[Hashable] = list(H_init or [])
+            Hset = set(H)
+            history: List[Tuple[Hashable, int]] = []
+
+            tau_arr = np.array([int(tau_map.get(v, 0)) for v in nonhubs], dtype=np.int64)
+            n = len(nonhubs)
+
+            seed_mask = np.zeros(n, dtype=bool)
+            for u in Hset:
+                if u == self.g:
                     continue
-                if focus_only_deficit:
-                    gain = sum(
-                        w for v in deficit_nodes for (src, w) in self.inbound.get(v, []) if src == u
-                    )
+                j = idx_of.get(u)  # type: ignore
+                if j is not None:
+                    seed_mask[j] = True
+
+            def compute_deficits(mask: np.ndarray) -> np.ndarray:
+                if edge_src.size == 0:
+                    seed_contrib = np.zeros(n, dtype=np.int64)
                 else:
-                    gain = sum(w for v in self.nodes if v != self.g for (src, w) in self.inbound.get(v, []) if src == u)
-                if gain > best_gain:
-                    best_gain = gain
-                    best_u = u
-            if best_u is None or best_gain <= 0:
-                if any(d > 0 for d in deficits.values()):
-                    print("[greedy_seed] No candidate improves deficit; inequality likely infeasible with remaining seeds.")
-                break
-            H.append(best_u)
-            Hset.add(best_u)
-            history.append((best_u, best_gain))
-            if max_seeds is not None and len(H) >= max_seeds:
-                break
+                    active = mask.astype(np.int64)
+                    weights = edge_w * active[edge_src]
+                    seed_contrib = np.bincount(edge_dst, weights=weights, minlength=n).astype(np.int64)
+                lhs = hub_arr + tau_arr + seed_contrib
+                d = (rest_arr - lhs)
+                d[d < 0] = 0
+                return d
+
+            deficits = compute_deficits(seed_mask)
+            if not np.any(deficits > 0):
+                return H, history
+
+            while True:
+                if focus_only_deficit:
+                    if edge_src.size == 0:
+                        gain_by_src = np.zeros(n, dtype=np.int64)
+                    else:
+                        mask_edges = (deficits[edge_dst] > 0)
+                        if mask_edges.any():
+                            gain_by_src = np.bincount(edge_src[mask_edges], weights=edge_w[mask_edges], minlength=n).astype(np.int64)
+                        else:
+                            gain_by_src = np.zeros(n, dtype=np.int64)
+                else:
+                    if edge_src.size == 0:
+                        gain_by_src = np.zeros(n, dtype=np.int64)
+                    else:
+                        gain_by_src = np.bincount(edge_src, weights=edge_w, minlength=n).astype(np.int64)
+
+                # Exclude hub and already seeded
+                cand_gain = gain_by_src.copy()
+                cand_gain[seed_mask] = -1
+
+                if cand_gain.size == 0:
+                    break
+                best_idx = int(np.argmax(cand_gain))
+                best_gain = int(cand_gain[best_idx])
+
+                if best_gain <= 0:
+                    if np.any(deficits > 0):
+                        print("[greedy_seed] No candidate improves deficit; inequality likely infeasible with remaining seeds.")
+                    break
+
+                best_u = nonhubs[best_idx]
+                H.append(best_u)
+                Hset.add(best_u)
+                seed_mask[best_idx] = True
+                history.append((best_u, best_gain))
+
+                if max_seeds is not None and len(H) >= max_seeds:
+                    break
+
+                deficits = compute_deficits(seed_mask)
+                if not np.any(deficits > 0):
+                    break
+
+            return H, history
+        except Exception:
+            # Fallback to original Python implementation
+            H: List[Hashable] = list(H_init or [])
+            Hset = set(H)
+            history: List[Tuple[Hashable, int]] = []
             if self.two_step_condition_holds(H, tau_map):
-                break
-        return H, history
+                return H, history
+            while True:
+                deficits = self.two_step_deficits(H, tau_map)
+                deficit_nodes = {v for v, d in deficits.items() if d > 0}
+                if not deficit_nodes:
+                    break
+                best_u = None
+                best_gain = -1
+                for u in self.nodes:
+                    if u == self.g or u in Hset:
+                        continue
+                    if focus_only_deficit:
+                        gain = sum(
+                            w for v in deficit_nodes for (src, w) in self.inbound.get(v, []) if src == u
+                        )
+                    else:
+                        gain = sum(w for v in self.nodes if v != self.g for (src, w) in self.inbound.get(v, []) if src == u)
+                    if gain > best_gain:
+                        best_gain = gain
+                        best_u = u
+                if best_u is None or best_gain <= 0:
+                    if any(d > 0 for d in deficits.values()):
+                        print("[greedy_seed] No candidate improves deficit; inequality likely infeasible with remaining seeds.")
+                    break
+                H.append(best_u)
+                Hset.add(best_u)
+                history.append((best_u, best_gain))
+                if max_seeds is not None and len(H) >= max_seeds:
+                    break
+                if self.two_step_condition_holds(H, tau_map):
+                    break
+            return H, history
 
     def apply_seed(self, s: Mapping[Hashable, str], H: Iterable[Hashable]) -> Dict[Hashable, str]:
         Hset = set(H)
@@ -258,11 +359,66 @@ class MajorityHubSim:
         return s_next
 
     def run_schedule(self, s: Mapping[Hashable, str], sched: Iterable[Hashable], tau_map: Mapping[Hashable, int] | None = None) -> Dict[Hashable, str]:
-        st = dict(s)
-        st[self.g] = G
-        for v in sched:
-            st = self.async_update(st, v, tau_map=tau_map)
-        return st
+        # Fast incremental NumPy path (general graphs), fallback to Python version if unavailable
+        try:
+            import numpy as np  # type: ignore
+            self._ensure_numpy()
+            nonhubs = self._nonhubs  # type: ignore
+            idx_of = self._idx_of  # type: ignore
+            edge_src = self._edge_src_idx  # type: ignore
+            edge_dst = self._edge_dst_idx  # type: ignore
+            edge_w = self._edge_w  # type: ignore
+            rest_arr = self._rest_nonhub_arr  # type: ignore
+            hub_arr = self._hub_w_arr  # type: ignore
+            out_ptr = self._out_ptr  # type: ignore
+            out_dst = self._out_dst  # type: ignore
+            out_w = self._out_w  # type: ignore
+
+            n = len(nonhubs)
+            x = np.zeros(n, dtype=np.int8)
+            for i, v in enumerate(nonhubs):
+                x[i] = 1 if s.get(v, N) == G else 0
+            tmap_src = self.tau if tau_map is None else tau_map
+            tarr = np.array([int(tmap_src.get(v, 0)) for v in nonhubs], dtype=np.int64)
+
+            if edge_src.size == 0:
+                sg_nonhub = np.zeros(n, dtype=np.int64)
+            else:
+                weights = (edge_w * x[edge_src]).astype(np.int64)
+                sg_nonhub = np.bincount(edge_dst, weights=weights, minlength=n).astype(np.int64)
+
+            sched_idx = [idx_of.get(v) for v in sched if v != self.g]  # type: ignore
+            # Remove Nones silently
+            sched_idx = [int(i) for i in sched_idx if i is not None]
+
+            for vi in sched_idx:
+                lhs = (sg_nonhub[vi] << 1) + hub_arr[vi] + tarr[vi]
+                rhs = rest_arr[vi]
+                new_state = 1 if lhs >= rhs else 0
+                old_state = int(x[vi])
+                if new_state != old_state:
+                    delta = (1 if new_state == 1 else -1)
+                    # Apply delta to all out-neighbors of vi
+                    b = int(out_ptr[vi])
+                    e = int(out_ptr[vi + 1])
+                    if e > b:
+                        dsts = out_dst[b:e]
+                        wts = out_w[b:e]
+                        # sg_nonhub[dst] += delta * w
+                        # Use vectorized update
+                        sg_nonhub[dsts] += (delta * wts)
+                    x[vi] = new_state
+
+            # Build result mapping
+            st = {v: (G if x[idx_of[v]] == 1 else N) for v in nonhubs}  # type: ignore
+            st[self.g] = G
+            return st
+        except Exception:
+            st = dict(s)
+            st[self.g] = G
+            for v in sched:
+                st = self.async_update(st, v, tau_map=tau_map)
+            return st
 
     def run_schedule_forced(
         self,
@@ -310,6 +466,67 @@ class MajorityHubSim:
                 continue
             margins[v] = self.hub_weight(v) + int(tau_map.get(v, 0)) - self.rest_weight(v)
         return margins
+
+    def _ensure_numpy(self) -> None:
+        if self._np_ready:
+            return
+        import numpy as np  # type: ignore
+        nonhubs = tuple(v for v in self.nodes if v != self.g)
+        idx_of: Dict[Hashable, int] = {v: i for i, v in enumerate(nonhubs)}
+        n = len(nonhubs)
+
+        edge_src: List[int] = []
+        edge_dst: List[int] = []
+        edge_w: List[int] = []
+        rest_arr = np.zeros(n, dtype=np.int64)
+        hub_arr = np.zeros(n, dtype=np.int64)
+
+        for v in nonhubs:
+            vi = idx_of[v]
+            for (u, w) in self.inbound.get(v, []):
+                if u == self.g:
+                    hub_arr[vi] += int(w)
+                else:
+                    ui = idx_of.get(u)
+                    if ui is None:
+                        continue
+                    edge_src.append(int(ui))
+                    edge_dst.append(int(vi))
+                    edge_w.append(int(w))
+                    rest_arr[vi] += int(w)
+
+        edge_src_arr = np.array(edge_src, dtype=np.int32) if edge_src else np.zeros(0, dtype=np.int32)
+        edge_dst_arr = np.array(edge_dst, dtype=np.int32) if edge_dst else np.zeros(0, dtype=np.int32)
+        edge_w_arr = np.array(edge_w, dtype=np.int64) if edge_w else np.zeros(0, dtype=np.int64)
+
+        # Build outbound CSR from edge lists
+        counts = np.zeros(n, dtype=np.int64)
+        if edge_src_arr.size:
+            counts += np.bincount(edge_src_arr, minlength=n)
+        out_ptr = np.zeros(n + 1, dtype=np.int64)
+        np.cumsum(counts, out_ptr[1:])
+        out_dst = np.zeros(edge_src_arr.size, dtype=np.int32)
+        out_w = np.zeros(edge_src_arr.size, dtype=np.int64)
+        if edge_src_arr.size:
+            next_slot = out_ptr.copy()
+            for e in range(edge_src_arr.size):
+                u = edge_src_arr[e]
+                i = next_slot[u]
+                out_dst[i] = edge_dst_arr[e]
+                out_w[i] = edge_w_arr[e]
+                next_slot[u] += 1
+
+        self._nonhubs = nonhubs
+        self._idx_of = idx_of
+        self._edge_src_idx = edge_src_arr
+        self._edge_dst_idx = edge_dst_arr
+        self._edge_w = edge_w_arr
+        self._rest_nonhub_arr = rest_arr
+        self._hub_w_arr = hub_arr
+        self._out_ptr = out_ptr
+        self._out_dst = out_dst
+        self._out_w = out_w
+        self._np_ready = True
 
     # --- Utilities for experiments and benchmarks ---
     def count_edges(self) -> int:
