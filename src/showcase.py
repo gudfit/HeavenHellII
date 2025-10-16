@@ -937,24 +937,31 @@ def showcase_scaling_law_heterogeneous(n: int = 60, density: float = 0.05, max_w
         ratio_pw = degmax_pw / max(1, W_star)
         print(f"Pointwise bound gap = {gap_pw}, ratio = {ratio_pw:.2f}x")
     if degmax_pw > 0:
-        improv = degmax_old / max(1, degmax_pw)
-        print(f"Improvement factor over old bound: {improv:.2f}x tighter")
+        if degmax_pw == degmax_old:
+            print("Improvement factor over old bound: equal (no tightening).")
+        else:
+            improv = degmax_old / max(1, degmax_pw)
+            print(f"Improvement factor over old bound: {improv:.2f}x tighter")
 
 
 def showcase_scale_free_generalization(n: int = 200, m: int = 2, tau: int = 0, seed: int | None = None) -> None:
-    """Show one-shot threshold behavior on scale-free graphs (heterogeneous degrees)."""
-    sim = build_scale_free_with_hub(n=n, m=m, W=0, seed=seed)
-    tau_map = {v: tau for v in sim.nodes}
-    W_star = sim.max_need_tau(tau_map)
+    """Show one-shot threshold behavior on a single fixed scale-free graph."""
+    if seed is None:
+        seed = 0
+    # Build one base graph and reuse it for all tests
+    sim_base = build_scale_free_with_hub(n=n, m=m, W=0, seed=seed)
+    tau_map = {v: tau for v in sim_base.nodes}
+    W_star = sim_base.max_need_tau(tau_map)
     print("-- Scale-free (BA) family --")
-    print(f"n={n}, m={m}, tau={tau}, exact W*={W_star}")
-    # Try just-below and at-threshold from all-Gnash
+    print(f"n={n}, m={m}, tau={tau}, seed={seed}, exact W*={W_star}")
+    # BELOW threshold on the SAME graph
     if W_star > 0:
-        sim_low = build_scale_free_with_hub(n=n, m=m, W=max(0, W_star - 1), seed=seed)
-        s0 = {v: N for v in sim.nodes if v != sim.g}
+        sim_low = sim_base.clone_with_hub_weights({v: (W_star - 1) for v in sim_base.nodes})
+        s0 = {v: N for v in sim_low.nodes if v != sim_low.g}
         s1 = sim_low.next_state({**s0, sim_low.g: G}, tau_override=tau_map)
         print(" below threshold success?", sim_low.is_all_glory(s1))
-    sim_at = build_scale_free_with_hub(n=n, m=m, W=W_star, seed=seed)
+    # AT threshold on the SAME graph
+    sim_at = sim_base.clone_with_hub_weights({v: W_star for v in sim_base.nodes})
     s0 = {v: N for v in sim_at.nodes if v != sim_at.g}
     s1 = sim_at.next_state({**s0, sim_at.g: G}, tau_override=tau_map)
     print(" at threshold success?   ", sim_at.is_all_glory(s1))
@@ -963,12 +970,12 @@ def showcase_scale_free_generalization(n: int = 200, m: int = 2, tau: int = 0, s
         import networkx as nx  # type: ignore
         import matplotlib.pyplot as plt  # type: ignore
         Gnx = nx.Graph()
-        Gnx.add_nodes_from([v for v in sim.nodes if v != sim.g])
-        for v in sim.nodes:
-            if v == sim.g:
+        Gnx.add_nodes_from([v for v in sim_base.nodes if v != sim_base.g])
+        for v in sim_base.nodes:
+            if v == sim_base.g:
                 continue
-            for (u, w) in sim.inbound.get(v, []):
-                if u != sim.g:
+            for (u, w) in sim_base.inbound.get(v, []):
+                if u != sim_base.g:
                     Gnx.add_edge(u, v)
         degs = [d for _, d in Gnx.degree()]
         plt.figure(figsize=(4, 3))
@@ -1196,8 +1203,11 @@ def showcase_degmax_gap_extreme(m: int = 120, M: int = 500) -> None:
     print(f"old degmax = {degmax_old}")
     print(f"Ratio old/exact = {ratio_old:.2f}x; pointwise/exact = {ratio_pw:.2f}x")
     if degmax_pw > 0:
-        improv = degmax_old / max(1, degmax_pw)
-        print(f"Improvement factor over old bound: {improv:.2f}x tighter")
+        if degmax_pw == degmax_old:
+            print("Improvement factor over old bound: equal (no tightening).")
+        else:
+            improv = degmax_old / max(1, degmax_pw)
+            print(f"Improvement factor over old bound: {improv:.2f}x tighter")
 
 
 def build_ring_with_two_hubs(
