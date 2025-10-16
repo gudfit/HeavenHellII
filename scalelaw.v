@@ -36,6 +36,44 @@ Module ScaleLaw.
         - exact HW.
       Qed.
 
+      (* A strictly stronger 'degmax' style bound:
+         use max over v of (indeg_nonhub v * max_in_nonhub v)
+         instead of (indeg_global * wmax_global). *)
+      Definition degmax_pointwise : nat :=
+        list_max
+          (map (fun v => @indeg_nonhub V dec allV w g v * @max_in_nonhub V dec allV w g v)
+               (HeavenHell.nonhubs dec allV g)).
+
+      Lemma max_rest_le_degmax_pointwise :
+        @max_rest V dec allV w g <= degmax_pointwise.
+      Proof.
+        unfold degmax_pointwise, max_rest.
+        eapply list_max_le_of_forall.
+        intros x Hx.
+        apply in_map_iff in Hx as [v [Hx Hin]]; subst x.
+        pose proof (@rest_le_indeg_times_max V dec allV allV_complete w g v) as Hrest.
+        eapply Nat.le_trans; [exact Hrest|].
+        (* show the product at v is <= list_max over mapped products *)
+        eapply (HeavenHell.list_max_In_le
+                  (map (fun v0 => @indeg_nonhub V dec allV w g v0 * @max_in_nonhub V dec allV w g v0)
+                       (HeavenHell.nonhubs dec allV g))
+                  (@indeg_nonhub V dec allV w g v * @max_in_nonhub V dec allV w g v)).
+        apply (@in_map V nat
+                 (fun v0 => @indeg_nonhub V dec allV w g v0 * @max_in_nonhub V dec allV w g v0)
+                 (HeavenHell.nonhubs dec allV g)
+                 v).
+        exact Hin.
+      Qed.
+
+      Theorem one_step_all_glory_if_W_ge_degmax_pointwise :
+        W >= degmax_pointwise ->
+        (forall s v, @next_heaven V dec allV w g s v = Glory).
+      Proof.
+        intro HW.
+        apply (proj2 (@uniform_hub_one_step_iff V dec allV allV_nodup allV_complete w g W hub_uniform)).
+        eapply Nat.le_trans; [apply max_rest_le_degmax_pointwise|exact HW].
+      Qed.
+
     End S.
   End UniformHub_NoTau.
 

@@ -333,6 +333,18 @@ class MajorityHubSim:
     def degmax_upper_bound(self) -> int:
         return self.indeg_global() * self.wmax_global()
 
+    def degmax_pointwise_upper_bound(self) -> int:
+        """Return max_v (indeg_nonhub(v) * max_in_nonhub(v)).
+
+        This tightens the classical product bound indeg_global * wmax_global by
+        taking the maximum of per-node products rather than multiplying two maxima
+        that may be achieved at different vertices.
+        """
+        return max(
+            (self.indeg_nonhub(v) * self.max_in_nonhub(v) for v in self.nodes if v != self.g),
+            default=0,
+        )
+
     def async_update(self, s: Mapping[Hashable, str], v: Hashable, tau_map: Mapping[Hashable, int] | None = None) -> Dict[Hashable, str]:
         """Update only node v using the same tie->Glory rule (hub forced G).
 
@@ -868,19 +880,28 @@ def showcase_scaling_law_regular_topologies(seed: int | None = None) -> None:
     print("-- Regular families --")
     for k in [1, 2, 3]:
         sim = build_ring_with_hub(n=60, k=k, W=0)
-        d = sim.max_rest()  # equals 2k
+        d = sim.max_rest()  # should equal 2k
         tau = 0
         w_star = sim.max_need_tau({v: tau for v in sim.nodes})
+        # Assertions to catch regressions: on k-nearest rings, d = 2k and W*(0) = 2k
+        assert d == 2 * k, (d, 2 * k)
+        assert w_star == 2 * k, (w_star, 2 * k)
         print(f"Ring: k={k}, degree d={d}, W* (tau=0)={w_star}")
     # Grid 4-neighbor: d = 4
     simg = build_grid_torus_with_hub(W=0, width=10, height=8)
     dg = simg.max_rest()
     w_star_g = simg.max_need_tau({v: 0 for v in simg.nodes})
+    # Grid 4-neighbor torus: degree d = 4, W*(0) = 4
+    assert dg == 4, (dg, 4)
+    assert w_star_g == 4, (w_star_g, 4)
     print(f"Grid: d={dg}, W* (tau=0)={w_star_g}")
     
     for d in [3, 5]:
         simd = build_random_d_regular_digraph(n=80, d=d, seed=seed)
         w_star_d = simd.max_need_tau({v: 0 for v in simd.nodes})
+        # In the builder each node has exactly d inbound unit-weight non-hub edges
+        assert simd.max_rest() == d, (simd.max_rest(), d)
+        assert w_star_d == d, (w_star_d, d)
         print(f"Random d-regular-like: d≈{d}, measured W*≈{w_star_d}")
 
 
@@ -900,14 +921,24 @@ def showcase_scaling_law_heterogeneous(n: int = 60, density: float = 0.05, max_w
                 inbound[v].append((u, random.randint(1, max_w)))
     sim = MajorityHubSim(nodes, inbound, g)
     W_star = sim.max_rest()
-    degmax = sim.degmax_upper_bound()
+    degmax_old = sim.degmax_upper_bound()
+    degmax_pw = sim.degmax_pointwise_upper_bound()
     print("-- Heterogeneous weighted graph --")
     print(f"Exact W* = max_rest = {W_star}")
-    print(f"Upper bound indeg_global*wmax_global = {degmax}")
-    if degmax > 0:
-        gap = degmax - W_star
-        ratio = degmax / max(1, W_star)
-        print(f"Gap = {gap}, ratio = {ratio:.2f}x")
+    equals = (degmax_pw == W_star)
+    print(f"degmax_pointwise = {degmax_pw}  ({'exact' if equals else 'loose'})")
+    print(f"old degmax = {degmax_old}")
+    if degmax_old > 0:
+        gap_old = degmax_old - W_star
+        ratio_old = degmax_old / max(1, W_star)
+        print(f"Old bound gap = {gap_old}, ratio = {ratio_old:.2f}x")
+    if degmax_pw > 0:
+        gap_pw = degmax_pw - W_star
+        ratio_pw = degmax_pw / max(1, W_star)
+        print(f"Pointwise bound gap = {gap_pw}, ratio = {ratio_pw:.2f}x")
+    if degmax_pw > 0:
+        improv = degmax_old / max(1, degmax_pw)
+        print(f"Improvement factor over old bound: {improv:.2f}x tighter")
 
 
 def showcase_scale_free_generalization(n: int = 200, m: int = 2, tau: int = 0, seed: int | None = None) -> None:
@@ -1071,6 +1102,19 @@ def phase_heterogeneous_tau_two_communities(
     print(f"W* (tau) = {w_star}")
     print(f"Argmax nodes (sample up to 10): {argmax_nodes[:10]}")
     print("Controlling community:", "hard" if hard_dominates else "easy")
+    # Audit pieces of the formula: max_rest and per-argmax need components
+    max_rest = sim.max_rest()
+    print(f"max_rest (tau=0) = {max_rest}")
+    sample = argmax_nodes[:min(5, len(argmax_nodes))]
+    details = []
+    for v in sample:
+        rv = sim.rest_weight(v)
+        tv = int(tau.get(v, 0))
+        need = max(0, rv - tv)
+        details.append((v, rv, tv, need))
+    if details:
+        pieces = " ".join(f"v={v}: rest={rv}, tau={tv}, rest-tau={need}" for (v, rv, tv, need) in details)
+        print("Argmax details:", pieces)
 
     s0 = checkerboard_ring(n)
     for W in [max(0, w_star - 1), w_star]:
@@ -1140,13 +1184,20 @@ def showcase_degmax_gap_extreme(m: int = 120, M: int = 500) -> None:
     """Show an extreme gap between the degmax upper bound and exact W*."""
     sim = build_gap_graph(m=m, M=M)
     W_star = sim.max_rest()
-    degmax = sim.degmax_upper_bound()
-    ratio = (degmax / max(1, W_star)) if W_star > 0 else float("inf")
+    degmax_old = sim.degmax_upper_bound()
+    degmax_pw = sim.degmax_pointwise_upper_bound()
+    ratio_old = (degmax_old / max(1, W_star)) if W_star > 0 else float("inf")
+    ratio_pw = (degmax_pw / max(1, W_star)) if W_star > 0 else float("inf")
     print("-- Extreme degmax gap example --")
     print(f"Parameters: m={m} (large indegree), M={M} (large max weight)")
     print(f"Exact W* = max_rest = {W_star}")
-    print(f"Upper bound indeg_global*wmax_global = {degmax}")
-    print(f"Ratio bound/exact = {ratio:.2f}x")
+    equals = (degmax_pw == W_star)
+    print(f"degmax_pointwise = {degmax_pw}  ({'exact' if equals else 'loose'})")
+    print(f"old degmax = {degmax_old}")
+    print(f"Ratio old/exact = {ratio_old:.2f}x; pointwise/exact = {ratio_pw:.2f}x")
+    if degmax_pw > 0:
+        improv = degmax_old / max(1, degmax_pw)
+        print(f"Improvement factor over old bound: {improv:.2f}x tighter")
 
 
 def build_ring_with_two_hubs(
@@ -1338,10 +1389,16 @@ def showcase_async_one_pass_fairness_ring(
     for t in range(trials):
         order = nonhubs[:]
         random.shuffle(order)
+        # One pass
         sT = sim.run_schedule({**s0, sim.g: G}, order, tau_map=tau_map)
-        ok = sim.is_all_glory(sT)
-        print(f" trial {t+1}: order covers all once -> all Glory = {ok}")
-        ok_all = ok_all and ok
+        ok1 = sim.is_all_glory(sT)
+        # Two and three passes (stability)
+        sT2 = sim.run_schedule(sT, order, tau_map=tau_map)
+        sT3 = sim.run_schedule(sT2, order, tau_map=tau_map)
+        ok2 = sim.is_all_glory(sT2)
+        ok3 = sim.is_all_glory(sT3)
+        print(f" trial {t+1}: 1-pass={ok1}, 2-pass={ok2}, 3-pass={ok3}")
+        ok_all = ok_all and ok1 and ok2 and ok3
     print("All trials succeeded?", ok_all)
 
 
@@ -1364,9 +1421,13 @@ def showcase_async_one_pass_fairness_grid(width: int = 8, height: int = 6, tau: 
         order = nonhubs[:]
         random.shuffle(order)
         sT = sim.run_schedule({**s0, sim.g: G}, order, tau_map=tau_map)
-        ok = sim.is_all_glory(sT)
-        print(f" trial {t+1}: order covers all once -> all Glory = {ok}")
-        ok_all = ok_all and ok
+        ok1 = sim.is_all_glory(sT)
+        sT2 = sim.run_schedule(sT, order, tau_map=tau_map)
+        sT3 = sim.run_schedule(sT2, order, tau_map=tau_map)
+        ok2 = sim.is_all_glory(sT2)
+        ok3 = sim.is_all_glory(sT3)
+        print(f" trial {t+1}: 1-pass={ok1}, 2-pass={ok2}, 3-pass={ok3}")
+        ok_all = ok_all and ok1 and ok2 and ok3
     print("All trials succeeded?", ok_all)
 
 
