@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Dict, Hashable, Iterable, List, Mapping, Tuple, Set
 
 
@@ -8,11 +7,19 @@ G = "G"  # Glory
 N = "N"  # Gnash
 
 
-@dataclass(frozen=True)
-class Edge:
-    src: Hashable
-    dst: Hashable
-    w: int
+def _save_or_show(fig, path: str | None = None) -> None:
+    """Save figure to `path` if provided; otherwise try to show.
+
+    Avoids warnings in headless runs by writing to disk.
+    """
+    try:
+        if path:
+            fig.savefig(path, bbox_inches="tight")
+        else:
+            import matplotlib.pyplot as plt  # type: ignore
+            plt.show()
+    except Exception:
+        pass
 
 
 class MajorityHubSim:
@@ -101,7 +108,8 @@ class MajorityHubSim:
         H_init: Iterable[Hashable] | None = None,
         max_seeds: int | None = None,
         focus_only_deficit: bool = True,
-    ) -> Tuple[List[Hashable], List[Tuple[Hashable, int]]]:
+        return_deficits: bool = False,
+    ) -> Tuple[List[Hashable], List[Tuple[Hashable, int]]] | Tuple[List[Hashable], List[Tuple[Hashable, int]], Dict[Hashable, int]]:
         """Greedy seed selection to satisfy the two-step condition."""
         # Fast NumPy path with vectorized gain computation (falls back if NumPy unavailable)
         try:
@@ -115,7 +123,8 @@ class MajorityHubSim:
             rest_arr = self._rest_nonhub_arr  # type: ignore
             hub_arr = self._hub_w_arr  # type: ignore
 
-            H: List[Hashable] = list(H_init or [])
+            # Ensure H contains only non-hubs
+            H: List[Hashable] = [u for u in (H_init or []) if u != self.g]
             Hset = set(H)
             history: List[Tuple[Hashable, int]] = []
 
@@ -144,7 +153,8 @@ class MajorityHubSim:
 
             deficits = compute_deficits(seed_mask)
             if not np.any(deficits > 0):
-                return H, history
+                final_deficits = {nonhubs[i]: int(deficits[i]) for i in range(n)}
+                return (H, history, final_deficits) if return_deficits else (H, history)
 
             while True:
                 if focus_only_deficit:
@@ -189,14 +199,17 @@ class MajorityHubSim:
                 if not np.any(deficits > 0):
                     break
 
-            return H, history
+            # Final deficits after greedy
+            final_deficits = {nonhubs[i]: int(deficits[i]) for i in range(n)}
+            return (H, history, final_deficits) if return_deficits else (H, history)
         except Exception:
             # Fallback to original Python implementation
-            H: List[Hashable] = list(H_init or [])
+            H: List[Hashable] = [u for u in (H_init or []) if u != self.g]
             Hset = set(H)
             history: List[Tuple[Hashable, int]] = []
             if self.two_step_condition_holds(H, tau_map):
-                return H, history
+                deficits = self.two_step_deficits(H, tau_map)
+                return (H, history, deficits) if return_deficits else (H, history)
             while True:
                 deficits = self.two_step_deficits(H, tau_map)
                 deficit_nodes = {v for v, d in deficits.items() if d > 0}
@@ -227,7 +240,9 @@ class MajorityHubSim:
                     break
                 if self.two_step_condition_holds(H, tau_map):
                     break
-            return H, history
+            # Final deficits after greedy
+            deficits = self.two_step_deficits(H, tau_map)
+            return (H, history, deficits) if return_deficits else (H, history)
 
     def apply_seed(self, s: Mapping[Hashable, str], H: Iterable[Hashable]) -> Dict[Hashable, str]:
         Hset = set(H)
@@ -370,6 +385,29 @@ class MajorityHubSim:
         s_next[self.g] = G
         return s_next
 
+    def _async_update_inplace(self, st: Dict[Hashable, str], v: Hashable, tau_map: Mapping[Hashable, int] | None = None) -> None:
+        """In-place async update of a single node for the fallback path.
+
+        Mirrors async_update but avoids per-step dict copies when NumPy is unavailable.
+        """
+        tau_map = tau_map or self.tau
+        if v == self.g:
+            st[v] = G
+            return
+        SG = 0
+        SN = 0
+        for (u, w) in self.inbound.get(v, []):
+            if u == self.g:
+                SG += w
+            else:
+                if st.get(u, N) == G:
+                    SG += w
+                else:
+                    SN += w
+        t = int(tau_map.get(v, 0))
+        st[v] = G if SG + t >= SN else N
+        st[self.g] = G
+
     def run_schedule(self, s: Mapping[Hashable, str], sched: Iterable[Hashable], tau_map: Mapping[Hashable, int] | None = None) -> Dict[Hashable, str]:
         # Fast incremental NumPy path (general graphs), fallback to Python version if unavailable
         try:
@@ -426,10 +464,11 @@ class MajorityHubSim:
             st[self.g] = G
             return st
         except Exception:
+            # Pure-Python fallback: in-place updates to avoid O(n^2) copying
             st = dict(s)
             st[self.g] = G
             for v in sched:
-                st = self.async_update(st, v, tau_map=tau_map)
+                self._async_update_inplace(st, v, tau_map=tau_map)
             return st
 
     def run_schedule_forced(
@@ -543,6 +582,13 @@ class MajorityHubSim:
     # --- Utilities for experiments and benchmarks ---
     def count_edges(self) -> int:
         return sum(len(self.inbound.get(v, [])) for v in self.nodes)
+
+    def count_nonhub_edges(self) -> int:
+        """Count non-hub inbound edges processed by async run_schedule (u != g, v != g)."""
+        return sum(
+            sum(1 for (u, _) in self.inbound.get(v, []) if u != self.g)
+            for v in self.nodes if v != self.g
+        )
 
     def clone_with_hub_weights(self, by_v: Mapping[Hashable, int]) -> "MajorityHubSim":
         """Return a new simulator with hub inbound weights set per node v.
@@ -666,14 +712,12 @@ def build_scale_free_with_hub(n: int, m: int = 2, W: int = 0, g: Hashable = "hub
             random.seed(seed)
         except Exception:
             pass
-    used_networkx = False
     try:
         import networkx as nx  # type: ignore
         Gnx = nx.barabasi_albert_graph(n=n, m=max(1, m), seed=seed)
         for u, v in Gnx.edges():
             inbound[v].append((u, 1))
             inbound[u].append((v, 1))
-        used_networkx = True
     except Exception:
         # Fallback: simple preferential attachment
         import random
@@ -777,7 +821,7 @@ def showcase_kill_checkerboard_grid(w: int = 10, h: int = 6) -> None:
         axes[1].axis("off")
         fig.suptitle("Grid checkerboard kill (heatmaps)")
         fig.tight_layout()
-        plt.show()
+        _save_or_show(fig, "grid_checkerboard_kill.png")
     except Exception:
         pass
 
@@ -831,7 +875,8 @@ def phase_uniform_tau_ring(n: int = 50, k: int = 3, t_max: int | None = None) ->
         plt.ylabel("W* (min uniform hub weight)")
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.show()
+        fig = plt.gcf()
+        _save_or_show(fig, "phase_ring_W_vs_tau.png")
     except Exception:
         pass
 
@@ -866,7 +911,8 @@ def phase_uniform_tau_grid(w: int = 10, h: int = 8, t_max: int | None = None) ->
         plt.ylabel("W* (min uniform hub weight)")
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.show()
+        fig = plt.gcf()
+        _save_or_show(fig, "phase_grid_W_vs_tau.png")
     except Exception:
         pass
 
@@ -984,7 +1030,8 @@ def showcase_scale_free_generalization(n: int = 200, m: int = 2, tau: int = 0, s
         plt.xlabel("degree")
         plt.ylabel("count")
         plt.tight_layout()
-        plt.show()
+        fig = plt.gcf()
+        _save_or_show(fig, "ba_degree_hist.png")
     except Exception:
         pass
 
@@ -1480,7 +1527,8 @@ def showcase_async_three_schedules_ring(n: int = 30, k: int = 2, tau: int = 0, s
         plt.xlabel("node")
         plt.ylabel("margin")
         plt.tight_layout()
-        plt.show()
+        fig = plt.gcf()
+        _save_or_show(fig, "async_margins_bar.png")
     except Exception:
         pass
 
@@ -1573,7 +1621,8 @@ def bench_run_schedule(sim: MajorityHubSim, trials: int = 3) -> Tuple[float, flo
     s = {v: (G if random.random() < 0.5 else N) for v in nonhubs}
     s[sim.g] = G
     sched = list(nonhubs)
-    m = sim.count_edges()
+    # Only count non-hub edges to match work done by run_schedule
+    m = sim.count_nonhub_edges()
     best = float("inf")
     for _ in range(trials):
         random.shuffle(sched)
@@ -1658,7 +1707,8 @@ def benchmark_scalability(
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.tight_layout()
-        plt.show()
+        fig = plt.gcf()
+        _save_or_show(fig, "runtime_scaling.png")
 
 
 if __name__ == "__main__":
